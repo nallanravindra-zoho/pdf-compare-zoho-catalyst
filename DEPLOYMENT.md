@@ -184,6 +184,21 @@ API. All of the following were found live, one redeploy at a time, and fixed:
    happens mid-request the job's DataStore row simply stops being updated — the
    widget isn't desynced, it's accurately showing the last phase written before
    the worker died. Fixing the OOM resolves both symptoms at once.
+10. **`check-report`/`job-status` taking ~22s on Catalyst vs. a few seconds on
+    Cloud Run.** `anthropic`, `google.generativeai`, and `xhtml2pdf` were all
+    imported at module top-level, so on every cold worker start they got fully
+    imported even for endpoints that never touch Gemini/Claude/PDF at all —
+    `google.generativeai` alone measured 2.7s+ to import locally, before even
+    reaching its own native crypto dependency chain; `xhtml2pdf` pulls in
+    `pyhanko` → `cryptography` too. Made all three lazy — imported inside the
+    one function each actually needs (`get_gemini_model()`/`extract_pdf_gemini()`,
+    `run_comparison()`, `generate_pdf_report()`) instead of at the top of the
+    file. Verified: `main.py` now imports cleanly in <0.2s with none of the
+    three installed at all, and `check-report`/`job-status` complete without
+    ever touching them; the actual `/analyze-quote` pipeline still resolves
+    them correctly when it reaches those steps. Complements — doesn't
+    replace — the memory bump in #9 and setting Min Instances (see §"Catalyst
+    project details" in CLAUDE.md) if cold starts are still slow after this.
 
 All fixes verified against the real installed `zcatalyst-sdk` source (not just
 docs, which are incomplete/inconsistent in places) and exercised with mocked

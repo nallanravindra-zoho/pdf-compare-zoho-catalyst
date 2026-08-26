@@ -59,13 +59,18 @@ import uuid
 import threading
 from datetime import datetime
 
-import anthropic
 import requests
 import zcatalyst_sdk
 from flask import make_response, jsonify
-import google.generativeai as genai
 from io import BytesIO
-from xhtml2pdf import pisa
+
+# anthropic, google.generativeai, and xhtml2pdf are deliberately NOT imported
+# here — they're heavy (google.generativeai alone measured 2.7s+ to import,
+# before even reaching its own native crypto deps; xhtml2pdf pulls in
+# pyhanko -> cryptography too, despite once being assumed "pure Python").
+# Importing them at module level meant EVERY cold start paid that cost even
+# for /job-status or /check-report, which never touch Gemini/Claude/PDF at
+# all. Imported lazily instead, inside the functions that actually use them.
 
 
 # ─────────────────────────────────────────────
@@ -708,6 +713,7 @@ def get_gemini_model() -> str:
     global _gemini_model_cache
     if _gemini_model_cache:
         return _gemini_model_cache
+    import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
     try:
         models = [m.name for m in genai.list_models(request_options={"timeout": 10})
@@ -725,6 +731,7 @@ def get_gemini_model() -> str:
 
 
 def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, prompt: str = "") -> tuple:
+    import google.generativeai as genai
     model = genai.GenerativeModel(
         model_name=model_name,
         generation_config={"temperature": 0, "response_mime_type": "application/json"}
@@ -774,6 +781,7 @@ def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, prompt: st
 # CLAUDE COMPARISON  (identical to app.py)
 # ═════════════════════════════════════════════════════════════
 def run_comparison(zoho_text: str, ppo_text: str, vq_text: str, token: str = "") -> dict:
+    import anthropic
     matching_prompt = load_claude_prompt(token)
     print(f"[claude] Prompt: {len(matching_prompt)} chars")
     client    = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
@@ -943,6 +951,7 @@ def check_subtotal_validation(quote, margin, ppo_header, vq_header) -> dict:
 # GENERATE PDF REPORT  (identical to app.py — full HTML template)
 # ═════════════════════════════════════════════════════════════
 def generate_pdf_report(result: dict, quote_subject: str, initiated_by: str = "") -> bytes:
+    from xhtml2pdf import pisa
     print("Generating PDF report...")
     t0 = time.time()
 

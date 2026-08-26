@@ -345,6 +345,7 @@ doc_compare → Logs).
 | `[DataStore] write error: INVALID_INPUT ... generated_at. datetime value expected` | `generated_at` is a real Catalyst `Datetime` column, not text — `datetime.now().isoformat()` (has a `T`, fractional seconds, no space) is rejected | Use `datetime.now().strftime("%Y-%m-%d %H:%M:%S")` — Catalyst `Datetime` columns want that exact space-separated, no-offset format |
 | `Worker (pid:...) was sent SIGKILL! Perhaps out of memory?` | Function memory too low for this dependency footprint (`google-generativeai`'s grpc/protobuf/cryptography chain + `anthropic` + PDF byte buffers) | `catalyst functions:config doc_compare --memory 512` (or higher) — not a code bug |
 | Widget spinner frozen on a stale phase forever | A `SIGKILL`/crash can't be caught by Python — the job's DataStore row simply stops being updated, so the widget keeps showing the last real phase it saw | Fix the underlying crash (usually the OOM above); the phase-tracking itself isn't broken, it's accurately reporting a dead job |
+| `check-report`/`job-status` slow (~20s+) vs. a few seconds on Cloud Run | `anthropic`/`google.generativeai`/`xhtml2pdf` were imported at module top-level, so every cold worker paid their full import cost (2.7s+ for `google.generativeai` alone) even for endpoints that never touch Gemini/Claude/PDF | Already fixed — those three are now imported lazily inside the one function each needs, not at the top of the file |
 | `RuntimeError: cannot schedule new futures after interpreter shutdown` (from `ex.submit()` in the PDF-download or Gemini-extraction block) | `concurrent.futures.ThreadPoolExecutor` shares ONE process-wide atexit-driven shutdown flag across every executor in the process — once it fires (e.g. a prior/abandoned invocation's worker teardown on Catalyst's warm-process reuse), it permanently breaks `.submit()` for every future request routed to that same warm worker, unrelated code included. This is NOT a "Catalyst bans threading" restriction — plain `threading.Thread` has no such shared flag and isn't affected | Already fixed — see `_run_parallel()` below, which uses raw `threading.Thread` instead of `ThreadPoolExecutor` for the same real parallelism without this fragility |
 
 ---
@@ -375,6 +376,12 @@ doc_compare → Logs).
 - The `strftime("%Y-%m-%d %H:%M:%S")` on `generated_at` in `_handle_analyze()` —
   do NOT swap it back for `datetime.now().isoformat()`; the `Datetime` column
   rejects that live with `INVALID_INPUT`
+- The lazy `import anthropic` / `import google.generativeai as genai` /
+  `from xhtml2pdf import pisa` inside `run_comparison()` /
+  `get_gemini_model()` + `extract_pdf_gemini()` / `generate_pdf_report()` —
+  do NOT hoist these back to module top-level; that made every cold worker
+  pay their import cost (`google.generativeai` alone measured 2.7s+) even for
+  `/job-status` and `/check-report`, which never touch any of the three
 
 ---
 
