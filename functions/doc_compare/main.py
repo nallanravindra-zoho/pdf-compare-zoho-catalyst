@@ -32,7 +32,8 @@ Columns    :
   status        — Single Line   (processing | done | error | cancelled)
   phase         — Single Line   (phase label shown in the widget)
   result_json   — Multi Line    (full Claude JSON blob)
-  generated_at  — Single Line   (ISO timestamp)
+  generated_at  — Datetime      (format "YYYY-MM-DD HH:MM:SS" — NOT isoformat(),
+                                 confirmed live via INVALID_INPUT on write)
   quote_ref     — Single Line   (Quotation_Reference from quote)
   error         — Multi Line    (error message when status=error)
 
@@ -427,7 +428,13 @@ def _handle_analyze(context, body: str):
         attach_pdf_to_quote(quote_id, pdf_bytes, token, report_name)
 
         # ── Done ──────────────────────────────────────────────
-        generated_at = datetime.now().isoformat()
+        # CompareJobs.generated_at is a real Catalyst DateTime column, which
+        # rejects Python's default isoformat() ("...T...+microseconds") —
+        # confirmed live via INVALID_INPUT. Catalyst DateTime columns expect
+        # "YYYY-MM-DD HH:MM:SS" (space-separated, no 'T', no offset, no
+        # fractional seconds) — this still round-trips through
+        # datetime.fromisoformat() in _ds_delete_old(), so no other change needed.
+        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _ds_write(context, job_id, {
             "status":       "done",
             "result_json":  json.dumps(result),

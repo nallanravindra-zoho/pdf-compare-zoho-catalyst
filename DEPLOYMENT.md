@@ -168,6 +168,22 @@ API. All of the following were found live, one redeploy at a time, and fixed:
    Console on every `catalyst deploy` and becomes the new source of truth,
    silently overwriting anything typed into the Console by hand. Fixed via
    `git update-index --skip-worktree` on that file — see §2 above.
+8. **`generated_at` write rejected**: `[DataStore] write error: INVALID_INPUT
+   ... datetime value expected`. `CompareJobs.generated_at` is a real Catalyst
+   `Datetime` column, not text as originally assumed — it rejects Python's
+   `datetime.now().isoformat()` (has a `T`, fractional seconds, no space).
+   Catalyst `Datetime` columns want `"YYYY-MM-DD HH:MM:SS"` exactly — fixed via
+   `datetime.now().strftime("%Y-%m-%d %H:%M:%S")`, confirmed against Zoho's own
+   column-type docs (`docs.catalyst.zoho.com/en/cloud-scale/help/data-store/columns`).
+9. **`Worker was sent SIGKILL! Perhaps out of memory?`** — not a code bug, a
+   resource-allocation one. The default 256MB is too small for this function's
+   dependency footprint (`google-generativeai` alone pulls in a heavy
+   grpc/protobuf/cryptography chain, plus `anthropic` and in-memory PDF
+   buffers). Fix: `catalyst functions:config doc_compare --memory 512` (bump
+   further if it recurs). A `SIGKILL` can't be caught by Python, so when this
+   happens mid-request the job's DataStore row simply stops being updated — the
+   widget isn't desynced, it's accurately showing the last phase written before
+   the worker died. Fixing the OOM resolves both symptoms at once.
 
 All fixes verified against the real installed `zcatalyst-sdk` source (not just
 docs, which are incomplete/inconsistent in places) and exercised with mocked

@@ -121,7 +121,7 @@ Table name: **CompareJobs**
 | `status` | Single Line | processing / done / error / cancelled |
 | `phase` | Single Line | Phase label shown in widget spinner |
 | `result_json` | Multi Line | Full Claude JSON output |
-| `generated_at` | Single Line | ISO timestamp |
+| `generated_at` | Datetime | `"YYYY-MM-DD HH:MM:SS"` — NOT `datetime.isoformat()`, which this column rejects live with `INVALID_INPUT` (no `T`, no offset, no fractional seconds) |
 | `quote_ref` | Single Line | Quotation_Reference from ZQ |
 | `error` | Multi Line | Error message when status=error |
 
@@ -342,6 +342,9 @@ doc_compare → Logs).
 | `'CatalystApp' object has no attribute 'get_token'` | No such method exists on the SDK's app object | `context.credential.token()` returns `(cred_type, token)` — but see below, that token still isn't CRM-scoped |
 | `401 ... OAUTH_SCOPE_MISMATCH` calling `zohoapis.com/crm/...` | `context.credential.token()` is scoped to Catalyst's own services only | Use `_get_token()`'s restored `CLIENT_ID`/`CLIENT_SECRET`/`REFRESH_TOKEN` flow — see "Zoho CRM auth" section |
 | DataStore write/read silently does nothing or errors | `table.update_row()`/`.get_rows()` used with a criteria dict — that API doesn't exist | Look up by `job_id` via ZCQL, update/delete by `ROWID` — see "Catalyst DataStore" section |
+| `[DataStore] write error: INVALID_INPUT ... generated_at. datetime value expected` | `generated_at` is a real Catalyst `Datetime` column, not text — `datetime.now().isoformat()` (has a `T`, fractional seconds, no space) is rejected | Use `datetime.now().strftime("%Y-%m-%d %H:%M:%S")` — Catalyst `Datetime` columns want that exact space-separated, no-offset format |
+| `Worker (pid:...) was sent SIGKILL! Perhaps out of memory?` | Function memory too low for this dependency footprint (`google-generativeai`'s grpc/protobuf/cryptography chain + `anthropic` + PDF byte buffers) | `catalyst functions:config doc_compare --memory 512` (or higher) — not a code bug |
+| Widget spinner frozen on a stale phase forever | A `SIGKILL`/crash can't be caught by Python — the job's DataStore row simply stops being updated, so the widget keeps showing the last real phase it saw | Fix the underlying crash (usually the OOM above); the phase-tracking itself isn't broken, it's accurately reporting a dead job |
 | `RuntimeError: cannot schedule new futures after interpreter shutdown` (from `ex.submit()` in the PDF-download or Gemini-extraction block) | `concurrent.futures.ThreadPoolExecutor` shares ONE process-wide atexit-driven shutdown flag across every executor in the process — once it fires (e.g. a prior/abandoned invocation's worker teardown on Catalyst's warm-process reuse), it permanently breaks `.submit()` for every future request routed to that same warm worker, unrelated code included. This is NOT a "Catalyst bans threading" restriction — plain `threading.Thread` has no such shared flag and isn't affected | Already fixed — see `_run_parallel()` below, which uses raw `threading.Thread` instead of `ThreadPoolExecutor` for the same real parallelism without this fragility |
 
 ---
@@ -369,6 +372,9 @@ doc_compare → Logs).
   `ThreadPoolExecutor`'s specific shared-atexit-flag fragility, not a ban on
   parallelism — `_run_parallel()` still runs both tasks concurrently on real
   OS threads with no latency cost
+- The `strftime("%Y-%m-%d %H:%M:%S")` on `generated_at` in `_handle_analyze()` —
+  do NOT swap it back for `datetime.now().isoformat()`; the `Datetime` column
+  rejects that live with `INVALID_INPUT`
 
 ---
 
