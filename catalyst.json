@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "targets": [
+      "doc_compare"
+    ],
+    "ignore": [],
+    "source": "functions"
+  }
+}

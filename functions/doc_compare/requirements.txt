@@ -1,0 +1,5 @@
+zcatalyst-sdk==1.4.0
+anthropic
+google-generativeai
+xhtml2pdf
+requests
