@@ -371,6 +371,11 @@ def _run_analysis_pipeline(context, job_id: str, quote_id: str, initiated_by: st
 
         # ── Fetch quote ───────────────────────────────────────
         _phase(context, job_id, "Fetching quote from Zoho...")
+        # Cosmetic delay only — this single REST call is fast enough (Catalyst
+        # calls zohoapis.com intra-network vs. Cloud Run's cross-cloud path)
+        # that the widget's 3s poll can otherwise skip straight past this
+        # phase. Padding so it's reliably visible; doesn't affect correctness.
+        time.sleep(2)
         quote = fetch_zoho_quote(quote_id, token)
         print(f"[{job_id}] Quote fields: {list(quote.keys())}")
 
@@ -411,6 +416,9 @@ def _run_analysis_pipeline(context, job_id: str, quote_id: str, initiated_by: st
 
         # ── Download PDFs in parallel ─────────────────────────
         _phase(context, job_id, "Downloading PDF attachments...")
+        # Cosmetic delay only — see note on the fetch-quote phase above; same
+        # intra-network-vs-cross-cloud reasoning applies to these two calls.
+        time.sleep(2)
         ppo_bytes, vq_bytes = _run_parallel(
             lambda: download_zoho_file(fid_ppo, token),
             lambda: download_zoho_file(fid_vq,  token),

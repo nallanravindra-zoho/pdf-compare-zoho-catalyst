@@ -239,3 +239,23 @@ docs, which are incomplete/inconsistent in places) and exercised with mocked
 unit tests before deployment. See `CLAUDE.md` for the full technical writeup of
 each ("Zoho CRM auth", "Catalyst DataStore", "Common issues & fixes", "What NOT
 to change" sections).
+
+### 2026-08-27 — Confirmed #11 works live; cosmetic 2s pad on two fast phases
+
+The background-thread fix in #11 above was verified live: the job reaches
+`status: done` correctly, so a `threading.Thread` spawned inside `handler()`
+does survive past the HTTP response on Catalyst's production runtime. That was
+the real open question from #11 — now confirmed, not just locally tested.
+
+Separately (not a bug, a widget-UX side effect): the `Fetching quote from
+Zoho...` and `Downloading PDF attachments...` phases were flashing past too
+fast for the widget's 3s poll to reliably catch, while every other phase
+showed up fine. Root cause: those two are the only phases whose duration is
+almost pure Zoho-API network latency, and Catalyst calls `zohoapis.com`
+intra-network (same infrastructure) vs. Cloud Run's cross-cloud path from GCP
+— so they now complete faster than they used to, shrinking below the poll
+window. The other phases (margin checks doing multiple lookups, Gemini/Claude
+inference) are slow for reasons unrelated to network path, so they were
+unaffected. Added a 2s `time.sleep()` right after each of those two `_phase()`
+calls, purely so they're reliably visible — no functional change, ~4s of
+added latency total per run.
