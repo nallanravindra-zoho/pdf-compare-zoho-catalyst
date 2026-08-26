@@ -86,7 +86,7 @@ Responses go back via `make_response(jsonify(body), status)` (Flask), not any
 ### Endpoints (all routed inside handler)
 | Method | Path | Function |
 |---|---|---|
-| POST | /analyze-quote | `_handle_analyze` — runs full pipeline |
+| POST | /analyze-quote | `_handle_analyze` — creates the job, spawns `_run_analysis_pipeline` on a background thread, returns `job_id` immediately (does NOT run the pipeline inline — see DEPLOYMENT.md changelog #11) |
 | GET | /job-status/{job_id} | `_handle_job_status` — poll for progress |
 | GET | /check-report/{quote_id} | `_handle_check_report` — existing report check |
 | POST | /cancel-job/{job_id} | `_handle_cancel` — cancel a running job |
@@ -237,7 +237,9 @@ back-calculation. Always `round(value, 2)` before sending to Claude.
 
 ---
 
-## Pipeline flow (inside _handle_analyze)
+## Pipeline flow (inside _run_analysis_pipeline — runs on a background thread
+spawned by _handle_analyze, NOT inline in the HTTP request; see "Zoho CRM auth"
+sibling section below and DEPLOYMENT.md changelog #11 for why)
 
 ```
 1. _get_token(context)
@@ -346,6 +348,7 @@ doc_compare → Logs).
 | `Worker (pid:...) was sent SIGKILL! Perhaps out of memory?` | Function memory too low for this dependency footprint (`google-generativeai`'s grpc/protobuf/cryptography chain + `anthropic` + PDF byte buffers) | `catalyst functions:config doc_compare --memory 512` (or higher) — not a code bug |
 | Widget spinner frozen on a stale phase forever | A `SIGKILL`/crash can't be caught by Python — the job's DataStore row simply stops being updated, so the widget keeps showing the last real phase it saw | Fix the underlying crash (usually the OOM above); the phase-tracking itself isn't broken, it's accurately reporting a dead job |
 | `check-report`/`job-status` slow (~20s+) vs. a few seconds on Cloud Run | `anthropic`/`google.generativeai`/`xhtml2pdf` were imported at module top-level, so every cold worker paid their full import cost (2.7s+ for `google.generativeai` alone) even for endpoints that never touch Gemini/Claude/PDF | Already fixed — those three are now imported lazily inside the one function each needs, not at the top of the file |
+| Widget spinner stuck on the first phase, then "Execution Time Exceeded" at the end, even though the job actually completed; `/cancel-job` did nothing | `_handle_analyze` ran the whole pipeline inline in one HTTP request (up to 540s), but the widget expects that endpoint to return fast with a `job_id` and poll `/job-status` separately, like Cloud Run's `BackgroundTasks` did | Already fixed — `_handle_analyze` now spawns `_run_analysis_pipeline` on a background thread and returns immediately. **Needs live verification that the thread survives past the response on Catalyst's runtime** — see DEPLOYMENT.md changelog #11 |
 | `RuntimeError: cannot schedule new futures after interpreter shutdown` (from `ex.submit()` in the PDF-download or Gemini-extraction block) | `concurrent.futures.ThreadPoolExecutor` shares ONE process-wide atexit-driven shutdown flag across every executor in the process — once it fires (e.g. a prior/abandoned invocation's worker teardown on Catalyst's warm-process reuse), it permanently breaks `.submit()` for every future request routed to that same warm worker, unrelated code included. This is NOT a "Catalyst bans threading" restriction — plain `threading.Thread` has no such shared flag and isn't affected | Already fixed — see `_run_parallel()` below, which uses raw `threading.Thread` instead of `ThreadPoolExecutor` for the same real parallelism without this fragility |
 
 ---
@@ -382,6 +385,11 @@ doc_compare → Logs).
   do NOT hoist these back to module top-level; that made every cold worker
   pay their import cost (`google.generativeai` alone measured 2.7s+) even for
   `/job-status` and `/check-report`, which never touch any of the three
+- `_handle_analyze`'s split into "create job + spawn background thread + return
+  immediately" vs. `_run_analysis_pipeline` (the actual work) — do NOT collapse
+  these back into one synchronous function; that held the widget's HTTP client
+  open past its own timeout and starved `/cancel-job`/`/job-status` of a free
+  worker while `/analyze-quote` was in flight. See DEPLOYMENT.md changelog #11.
 
 ---
 

@@ -314,6 +314,18 @@ def _run_parallel(*tasks):
 # ENDPOINTS
 # ═════════════════════════════════════════════════════════════
 def _handle_analyze(context, body: str):
+    """
+    Creates the job and returns job_id immediately — the widget expects this
+    response fast so it can start polling /job-status for live progress (the
+    original Cloud Run shape, via FastAPI BackgroundTasks). The real pipeline
+    runs in a background thread (_run_analysis_pipeline) so this HTTP
+    request/response cycle isn't held open for the full ~30s-540s duration.
+    Running the whole pipeline synchronously in this one request (as before)
+    held the widget's own HTTP client open past its client-side timeout, and
+    starved /cancel-job and /job-status of a free worker to even execute on
+    while /analyze-quote was still in flight — confirmed live: cancel silently
+    did nothing, and the job always ran to completion regardless.
+    """
     body         = json.loads(body or "{}")
     quote_id     = body.get("quote_id")
     initiated_by = body.get("initiated_by", "")
@@ -333,6 +345,22 @@ def _handle_analyze(context, body: str):
     except Exception:
         pass
 
+    threading.Thread(
+        target=_run_analysis_pipeline,
+        args=(context, job_id, quote_id, initiated_by),
+        daemon=False,
+    ).start()
+
+    return _resp(200, {"job_id": job_id})
+
+
+def _run_analysis_pipeline(context, job_id: str, quote_id: str, initiated_by: str):
+    """
+    The actual compare pipeline — runs in the background thread _handle_analyze
+    spawns. There is no HTTP response to return through from here: all progress
+    and the final result/error go through DataStore (_phase/_ds_write) for the
+    widget's /job-status polling to pick up.
+    """
     try:
         token = _get_token(context)
 
@@ -353,7 +381,7 @@ def _handle_analyze(context, body: str):
             print(f"[{job_id}] ⚠️  Margin gate NEEDS REVIEW — continuing anyway")
 
         # ── Format quote for Claude ───────────────────────────
-        if _is_cancelled(context, job_id): return _resp(200, {"job_id": job_id})
+        if _is_cancelled(context, job_id): return
         zoho_text   = format_zoho_quote(quote)
         quote_ref   = quote.get("Quotation_Reference", "")
         safe_ref    = re.sub(r'[^\w\-_.]', '_', str(quote_ref).strip())
@@ -408,7 +436,7 @@ def _handle_analyze(context, body: str):
 
         # ── Claude comparison ─────────────────────────────────
         _phase(context, job_id, "Comparing documents with Claude AI...")
-        if _is_cancelled(context, job_id): return _resp(200, {"job_id": job_id})
+        if _is_cancelled(context, job_id): return
         result = run_comparison(zoho_text, ppo_text, vq_text, token)
 
         # ── Attach margin gate & subtotal validation ──────────
@@ -447,14 +475,12 @@ def _handle_analyze(context, body: str):
             "quote_ref":    quote_ref
         })
         print(f"[{job_id}] ✅ Complete")
-        return _resp(200, {"job_id": job_id})
 
     except Exception as e:
         import traceback
         print(f"[{job_id}] ❌ {traceback.format_exc()}")
         if _ds_read(context, job_id).get("status") != "cancelled":
             _ds_write(context, job_id, {"status": "error", "error": str(e)})
-        return _resp(200, {"job_id": job_id})
 
 
 def _handle_job_status(context, job_id: str):

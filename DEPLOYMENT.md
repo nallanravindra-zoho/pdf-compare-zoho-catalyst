@@ -199,6 +199,40 @@ API. All of the following were found live, one redeploy at a time, and fixed:
     them correctly when it reaches those steps. Complements — doesn't
     replace — the memory bump in #9 and setting Min Instances (see §"Catalyst
     project details" in CLAUDE.md) if cold starts are still slow after this.
+11. **⚠️ Architecture fix, needs live verification — widget spinner stuck on the
+    first phase, then an "Execution Time Exceeded" error at the end, even
+    though the pipeline actually completed; `/cancel-job` silently did
+    nothing, jobs always ran to completion regardless.** Root cause:
+    `_handle_analyze()` ran the *entire* pipeline synchronously inside one
+    `POST /analyze-quote` request/response cycle (up to Catalyst's 540s
+    ceiling), but the widget (carried over unchanged from Cloud Run) expects
+    that endpoint to return almost immediately with just a `job_id`, then poll
+    `/job-status` separately for live progress — that's what Cloud Run's
+    `app.py` actually did via FastAPI `BackgroundTasks`. Holding the original
+    request open for the full duration meant: the widget's own HTTP client
+    timed out waiting past its own deadline (the "Execution Time Exceeded"),
+    and `/cancel-job`/`/job-status` calls arriving while `/analyze-quote` was
+    still in flight had no way to be observed by anything until it finished.
+
+    Fix: split `_handle_analyze()` into (a) create the job, spawn the real
+    pipeline on a background `threading.Thread`, return `job_id`
+    *immediately*, and (b) `_run_analysis_pipeline()` — the actual work,
+    unchanged logic, just running detached from the HTTP response.
+
+    **This one has a real unknown that only a live deploy can answer**: does a
+    background thread spawned inside an Advanced I/O function's `handler()`
+    keep running after the HTTP response is sent and `handler()` returns, on
+    Catalyst's actual production runtime? Verified locally that the Python
+    mechanics work (response returns in ~0ms, thread keeps running and
+    correctly writes to DataStore afterward, including a real network call in
+    the test) — but that can't prove Catalyst's infrastructure doesn't reap
+    the worker's compute the moment the response is flushed. **After
+    deploying this, run one real quote through it and confirm the job
+    actually reaches `status: done` (report attached to the quote) — not just
+    that the widget stops erroring.** If jobs start getting silently stuck
+    mid-pipeline instead, that's this assumption failing, and the real fix
+    would be a Catalyst Job Function (a dedicated async execution unit)
+    instead of a same-process thread.
 
 All fixes verified against the real installed `zcatalyst-sdk` source (not just
 docs, which are incomplete/inconsistent in places) and exercised with mocked
