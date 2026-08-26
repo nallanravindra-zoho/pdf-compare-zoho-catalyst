@@ -5,8 +5,10 @@ Complete drop-in replacement for app.py (Cloud Run / FastAPI).
 
 WHAT CHANGED vs app.py
 ───────────────────────
-1. No FastAPI / uvicorn — Catalyst uses handler(context, event).
-2. No OAuth token management — context.get_token() returns a live token.
+1. No FastAPI / uvicorn — Catalyst uses handler(request).
+2. No OAuth token management — context.get_token() returns a live token
+   (context = zcatalyst_sdk.initialize(), NOT request.catalyst — that
+   attribute doesn't exist on the Request object).
 3. No in-memory jobs={} — Catalyst DataStore table "CompareJobs" replaces it.
 4. No background thread — Catalyst runs synchronously up to 540s.
    The pipeline runs end-to-end in handle_analyze(); DataStore writes
@@ -53,11 +55,13 @@ import re
 import os
 import time
 import uuid
-import concurrent.futures
+import threading
 from datetime import datetime
 
 import anthropic
 import requests
+import zcatalyst_sdk
+from flask import make_response, jsonify
 import google.generativeai as genai
 from io import BytesIO
 from xhtml2pdf import pisa
@@ -97,22 +101,25 @@ _USD_RATES = {"USD": 1.0, "AED": 1/3.6725, "SAR": 1/3.7500, "QAR": 1/3.6500}
 # DataStore table name
 _DS_TABLE = "CompareJobs"
 
+# job_id is always a server-generated uuid4 string — validated before ZCQL interpolation
+_JOB_ID_RE = re.compile(r'^[0-9a-fA-F-]{1,64}$')
+
 
 # ═════════════════════════════════════════════════════════════
 # CATALYST ENTRY POINT
 # ═════════════════════════════════════════════════════════════
 def handler(request):
     """
-    Catalyst Advanced I/O handler — receives a single `request` object.
-    request.catalyst  → Catalyst context (token, datastore, etc.)
-    request.method    → HTTP method string
-    request.url       → full request URL
-    request.body      → raw request body (bytes or string)
+    Catalyst Advanced I/O handler — `request` is a Flask Request object.
+    zcatalyst_sdk.initialize()  → Catalyst context (token, datastore, etc.)
+    request.method       → HTTP method string
+    request.url          → full request URL
+    request.get_data()   → raw request body (bytes) — Flask Request has no .body
     """
-    context = request.catalyst
+    context = zcatalyst_sdk.initialize()
     path    = str(request.url or "")
     method  = (request.method or "GET").upper()
-    body    = request.body if isinstance(request.body, str) else (request.body or b"").decode("utf-8", errors="ignore")
+    body    = request.get_data(as_text=True) or ""
 
     try:
         if method == "POST" and "analyze-quote" in path:
@@ -139,37 +146,44 @@ def handler(request):
 
 
 def _resp(status: int, body: dict):
-    """Return a Catalyst Advanced I/O compatible response."""
-    import catalyst
-    response = catalyst.response()
-    response.status_code = status
-    response.set_header("Content-Type", "application/json")
-    response.body = json.dumps(body)
-    return response
+    """Return a Flask-compatible response (Catalyst Advanced I/O uses Flask under the hood)."""
+    return make_response(jsonify(body), status)
 
 
 # ═════════════════════════════════════════════════════════════
 # DATASTORE HELPERS  (replaces in-memory jobs={} from app.py)
 # ═════════════════════════════════════════════════════════════
 def _ds_write(context, job_id: str, data: dict):
-    """Upsert a job row in the CompareJobs DataStore table."""
+    """
+    Upsert a job row in the CompareJobs DataStore table.
+    Catalyst rows are keyed by a system ROWID, not by our own job_id column, and
+    Table has no filter-by-column update — so look the row up by job_id first (via
+    ZCQL) and update by ROWID, or insert a new row if none exists yet.
+    """
     try:
-        table = context.datastore().table(_DS_TABLE)
-        row   = {"job_id": job_id, **data}
-        try:
-            # Catalyst DataStore: update_row(criteria_dict, update_dict)
-            table.update_row({"job_id": job_id}, row)
-        except Exception:
-            table.insert_row(row)
+        table    = context.datastore().table(_DS_TABLE)
+        existing = _ds_read(context, job_id)
+        if existing.get("ROWID"):
+            table.update_row({"ROWID": existing["ROWID"], **data})
+        else:
+            table.insert_row({"job_id": job_id, **data})
     except Exception as e:
         print(f"[DataStore] write error: {e}")
 
 
 def _ds_read(context, job_id: str) -> dict:
-    """Read a job row from CompareJobs."""
+    """
+    Read a job row from CompareJobs by job_id.
+    Table has no get_rows()/filter-by-column call — only get_row(ROWID) and
+    get_paged_rows() — so a column lookup has to go through ZCQL instead.
+    """
+    if not job_id or not _JOB_ID_RE.match(job_id):
+        return {}
     try:
-        rows = context.datastore().table(_DS_TABLE).get_rows({"job_id": job_id})
-        return rows[0] if rows else {}
+        rows = context.zcql().execute_query(
+            f"SELECT * FROM {_DS_TABLE} WHERE job_id = '{job_id}'"
+        )
+        return rows[0].get(_DS_TABLE, {}) if rows else {}
     except Exception as e:
         print(f"[DataStore] read error: {e}")
         return {}
@@ -178,15 +192,14 @@ def _ds_read(context, job_id: str) -> dict:
 def _ds_delete_old(context, max_age_hours: int = 24):
     """Housekeeping — delete rows older than max_age_hours to avoid table bloat."""
     try:
-        table     = context.datastore().table(_DS_TABLE)
-        all_rows  = table.get_rows({})
-        cutoff    = time.time() - max_age_hours * 3600
-        for row in all_rows:
+        table  = context.datastore().table(_DS_TABLE)
+        cutoff = time.time() - max_age_hours * 3600
+        for row in table.get_iterable_rows():
             ts = row.get("generated_at") or ""
             try:
                 row_time = datetime.fromisoformat(ts).timestamp()
                 if row_time < cutoff:
-                    table.delete_row({"job_id": row.get("job_id")})
+                    table.delete_row(row.get("ROWID"))
             except Exception:
                 pass
     except Exception as e:
@@ -205,15 +218,90 @@ def _phase(context, job_id: str, phase: str):
 
 
 # ═════════════════════════════════════════════════════════════
-# AUTH  (replaces get_access_token from app.py)
+# AUTH  (same refresh-token flow as the original Cloud Run app.py)
 # ═════════════════════════════════════════════════════════════
+# Catalyst's own context.credential.token() authenticates the caller to the
+# CATALYST PROJECT (DataStore/Cache/Filestore) — confirmed live via Zoho's
+# OAUTH_SCOPE_MISMATCH error that it carries no Zoho CRM API scope at all.
+# There's no Catalyst-native way to get a CRM-scoped token for free, so this
+# restores the same client_id/secret/refresh_token exchange app.py used.
+CLIENT_ID     = os.environ.get("CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
+REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "")
+ZOHO_ACCOUNTS_URL = os.environ.get("ZOHO_ACCOUNTS_URL", "https://accounts.zoho.com")
+
+_zoho_token_cache = {"token": None, "expires_at": 0}
+
+
 def _get_token(context) -> str:
     """
-    Returns a live Zoho OAuth token from Catalyst context.
-    Catalyst rotates it automatically — never expires mid-function.
-    No CLIENT_ID / CLIENT_SECRET / REFRESH_TOKEN needed.
+    Returns a live Zoho CRM OAuth access token, refreshing it via the standard
+    refresh_token grant when the cached one is missing/expired. Cached at module
+    level so a warm Catalyst worker reuses one token across invocations instead
+    of hitting accounts.zoho.com on every call.
     """
-    return context.get_token()
+    now = time.time()
+    if _zoho_token_cache["token"] and now < _zoho_token_cache["expires_at"] - 60:
+        return _zoho_token_cache["token"]
+
+    if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
+        raise RuntimeError(
+            "CLIENT_ID / CLIENT_SECRET / REFRESH_TOKEN are not set "
+            "(Catalyst Console → Functions → doc_compare → Env Vars). "
+            "Catalyst's own credential has no Zoho CRM API scope, so these "
+            "are required — see OAUTH_SCOPE_MISMATCH."
+        )
+
+    r = requests.post(f"{ZOHO_ACCOUNTS_URL}/oauth/v2/token", data={
+        "grant_type":    "refresh_token",
+        "refresh_token": REFRESH_TOKEN,
+        "client_id":     CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+    }, timeout=20)
+    data = r.json()
+    if "access_token" not in data:
+        raise RuntimeError(f"Zoho token refresh failed: {data}")
+
+    _zoho_token_cache["token"]      = data["access_token"]
+    _zoho_token_cache["expires_at"] = now + data.get("expires_in", 3600)
+    print(f"[auth] Refreshed Zoho CRM token, expires in {data.get('expires_in', 3600)}s")
+    return _zoho_token_cache["token"]
+
+
+# ═════════════════════════════════════════════════════════════
+# PARALLELISM  (raw threading.Thread — NOT concurrent.futures.ThreadPoolExecutor)
+# ═════════════════════════════════════════════════════════════
+def _run_parallel(*tasks):
+    """
+    Run zero-arg callables concurrently on real OS threads and return their
+    results in the same order, re-raising the first exception if any failed.
+
+    Deliberately NOT concurrent.futures.ThreadPoolExecutor: that module keeps a
+    single process-wide atexit hook shared by every executor in the process.
+    Once it fires (real interpreter shutdown, e.g. a prior/abandoned invocation's
+    worker teardown on a platform that reuses warm processes), it permanently
+    breaks .submit() on every ThreadPoolExecutor for the rest of that process's
+    life — "cannot schedule new futures after interpreter shutdown" — even for
+    an unrelated new request. Plain threading.Thread has no such shared flag,
+    so it gives the same real parallelism without that fragility.
+    """
+    results = [None] * len(tasks)
+    errors  = [None] * len(tasks)
+
+    def _runner(i, fn):
+        try:
+            results[i] = fn()
+        except Exception as e:
+            errors[i] = e
+
+    threads = [threading.Thread(target=_runner, args=(i, fn)) for i, fn in enumerate(tasks)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    for e in errors:
+        if e is not None:
+            raise e
+    return results
 
 
 # ═════════════════════════════════════════════════════════════
@@ -289,11 +377,10 @@ def _handle_analyze(context, body: str):
 
         # ── Download PDFs in parallel ─────────────────────────
         _phase(context, job_id, "Downloading PDF attachments...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            f_ppo_dl = ex.submit(download_zoho_file, fid_ppo, token)
-            f_vq_dl  = ex.submit(download_zoho_file, fid_vq,  token)
-            ppo_bytes = f_ppo_dl.result()
-            vq_bytes  = f_vq_dl.result()
+        ppo_bytes, vq_bytes = _run_parallel(
+            lambda: download_zoho_file(fid_ppo, token),
+            lambda: download_zoho_file(fid_vq,  token),
+        )
 
         if not is_valid_pdf(ppo_bytes):
             raise Exception(f"{PPO_PDF_FIELD} is not a valid PDF file.")
@@ -305,11 +392,10 @@ def _handle_analyze(context, body: str):
         gemini_model  = get_gemini_model()
         gemini_prompt = load_gemini_prompt(token)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            f_ppo_ex = ex.submit(extract_pdf_gemini, ppo_bytes, "Partner PO PDF", gemini_model, gemini_prompt)
-            f_vq_ex  = ex.submit(extract_pdf_gemini, vq_bytes,  "VQ PDF",         gemini_model, gemini_prompt)
-            ppo_text, ppo_header = f_ppo_ex.result()
-            vq_text,  vq_header  = f_vq_ex.result()
+        (ppo_text, ppo_header), (vq_text, vq_header) = _run_parallel(
+            lambda: extract_pdf_gemini(ppo_bytes, "Partner PO PDF", gemini_model, gemini_prompt),
+            lambda: extract_pdf_gemini(vq_bytes,  "VQ PDF",         gemini_model, gemini_prompt),
+        )
 
         print(f"[{job_id}] VQ TEXT: {vq_text[:200]}")
         print(f"[{job_id}] PPO TEXT: {ppo_text[:200]}")
@@ -486,10 +572,20 @@ def load_claude_prompt(token: str = "") -> str:
 # ═════════════════════════════════════════════════════════════
 # ZOHO API HELPERS  (identical to app.py)
 # ═════════════════════════════════════════════════════════════
+def _raise_for_zoho(r):
+    """
+    r.raise_for_status() alone drops the response body — Zoho's OAuth/API errors
+    (wrong scope, wrong data center, expired token, etc.) are JSON in the body,
+    not the status line, so surface it instead of a bare '401 Client Error'.
+    """
+    if not r.ok:
+        raise requests.HTTPError(f"{r.status_code} {r.reason} for {r.url}: {r.text[:500]}", response=r)
+
+
 def fetch_zoho_quote(quote_id: str, token: str) -> dict:
     url = f"{ZOHO_BASE_URL}/crm/v3/Quotes/{quote_id}"
     r   = requests.get(url, headers={"Authorization": f"Zoho-oauthtoken {token}"}, timeout=30)
-    r.raise_for_status()
+    _raise_for_zoho(r)
     quote = r.json()["data"][0]
     print(f"✅ Quote fetched: {quote.get('Subject', quote_id)}")
     return quote
@@ -498,7 +594,7 @@ def fetch_zoho_quote(quote_id: str, token: str) -> dict:
 def download_zoho_file(file_id: str, token: str) -> bytes:
     url = f"{ZOHO_BASE_URL}/crm/v3/files?id={file_id}"
     r   = requests.get(url, headers={"Authorization": f"Zoho-oauthtoken {token}"}, timeout=60)
-    r.raise_for_status()
+    _raise_for_zoho(r)
     print(f"✅ Downloaded {file_id} ({len(r.content)} bytes)")
     return r.content
 
@@ -511,7 +607,7 @@ def check_existing_report(quote_id: str, token: str, report_name: str = None):
             timeout=30)
     if r.status_code in (204, 404):
         return None
-    r.raise_for_status()
+    _raise_for_zoho(r)
     for a in r.json().get("data", []):
         fname = a.get("File_Name", "")
         if report_name and fname == report_name:
@@ -534,7 +630,7 @@ def attach_pdf_to_quote(quote_id: str, pdf_bytes: bytes, token: str, report_name
             timeout=60)
     if r.status_code == 400:
         return _attach_via_filestore(quote_id, pdf_bytes, token, report_name)
-    r.raise_for_status()
+    _raise_for_zoho(r)
     return r.json().get("data", [{}])[0].get("details", {}).get("id")
 
 
@@ -544,7 +640,7 @@ def _attach_via_filestore(quote_id: str, pdf_bytes: bytes, token: str, report_na
             headers=headers,
             files={"file": (report_name, pdf_bytes, "application/pdf")},
             timeout=60)
-    r.raise_for_status()
+    _raise_for_zoho(r)
     file_id = r.json().get("data", [{}])[0].get("details", {}).get("id")
     if not file_id:
         raise Exception("No file_id from filestore: " + r.text[:200])
@@ -552,7 +648,7 @@ def _attach_via_filestore(quote_id: str, pdf_bytes: bytes, token: str, report_na
             headers={**headers, "Content-Type": "application/json"},
             json={"attachments": [{"id": file_id}]},
             timeout=30)
-    r2.raise_for_status()
+    _raise_for_zoho(r2)
     return r2.json().get("data", [{}])[0].get("details", {}).get("id")
 
 
@@ -735,7 +831,7 @@ def search_zoho_record_by_name(module, name, name_field, token):
             params={"criteria": f"({name_field}:equals:{name})"},
             timeout=30)
     if r.status_code == 204: return None
-    r.raise_for_status()
+    _raise_for_zoho(r)
     data = r.json().get("data", [])
     return data[0] if data else None
 
@@ -746,7 +842,7 @@ def fetch_zoho_record(module, record_id, token, fields=None):
             headers={"Authorization": f"Zoho-oauthtoken {token}"},
             params={"fields": fields} if fields else {},
             timeout=30)
-    r.raise_for_status()
+    _raise_for_zoho(r)
     data = r.json().get("data", [])
     if not data: raise Exception(f"No record found: {module}/{record_id}")
     return data[0]
