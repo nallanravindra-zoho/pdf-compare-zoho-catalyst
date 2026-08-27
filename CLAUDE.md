@@ -349,6 +349,7 @@ doc_compare → Logs).
 | Widget spinner frozen on a stale phase forever | A `SIGKILL`/crash can't be caught by Python — the job's DataStore row simply stops being updated, so the widget keeps showing the last real phase it saw | Fix the underlying crash (usually the OOM above); the phase-tracking itself isn't broken, it's accurately reporting a dead job |
 | `check-report`/`job-status` slow (~20s+) vs. a few seconds on Cloud Run | `anthropic`/`google.generativeai`/`xhtml2pdf` were imported at module top-level, so every cold worker paid their full import cost (2.7s+ for `google.generativeai` alone) even for endpoints that never touch Gemini/Claude/PDF | Already fixed — those three are now imported lazily inside the one function each needs, not at the top of the file |
 | Widget spinner stuck on the first phase, then "Execution Time Exceeded" at the end, even though the job actually completed; `/cancel-job` did nothing | `_handle_analyze` ran the whole pipeline inline in one HTTP request (up to 540s), but the widget expects that endpoint to return fast with a `job_id` and poll `/job-status` separately, like Cloud Run's `BackgroundTasks` did | Fixed and confirmed live — `_handle_analyze` spawns `_run_analysis_pipeline` on a background thread and returns immediately; verified the thread does survive past the response on Catalyst's production runtime (see DEPLOYMENT.md changelog #11/#12) |
+| Clicking Cancel doesn't stop the job — it keeps running to completion regardless | Only 2 of what's now 6 cancellation checkpoints existed, and none of them could interrupt an in-flight Claude stream call (often the single longest step) — a cancel click landing after the last checkpoint had already passed, or during the Claude call itself, was never caught | Fixed — checkpoints added before PDF download, before Gemini extraction, right after Claude, and before the final attach; plus a periodic (~2s) cancellation check inside the Claude streaming loop itself. See DEPLOYMENT.md changelog #13 |
 | "Fetching quote from Zoho..." / "Downloading PDF attachments..." phases flash past, never visible in the widget, while every other phase shows fine | Those two phases are almost pure Zoho-API network latency, and Catalyst calls `zohoapis.com` intra-network vs. Cloud Run's cross-cloud path from GCP — they now complete faster than the widget's 3s poll interval can reliably catch. Not a bug — the phases are genuinely written, just too briefly | Cosmetic only: 2s `time.sleep()` added right after each of those two `_phase()` calls so they're reliably visible — see DEPLOYMENT.md changelog #12 |
 | `RuntimeError: cannot schedule new futures after interpreter shutdown` (from `ex.submit()` in the PDF-download or Gemini-extraction block) | `concurrent.futures.ThreadPoolExecutor` shares ONE process-wide atexit-driven shutdown flag across every executor in the process — once it fires (e.g. a prior/abandoned invocation's worker teardown on Catalyst's warm-process reuse), it permanently breaks `.submit()` for every future request routed to that same warm worker, unrelated code included. This is NOT a "Catalyst bans threading" restriction — plain `threading.Thread` has no such shared flag and isn't affected | Already fixed — see `_run_parallel()` below, which uses raw `threading.Thread` instead of `ThreadPoolExecutor` for the same real parallelism without this fragility |
 
@@ -396,6 +397,12 @@ doc_compare → Logs).
   debug code. Without it those two phases complete faster than the widget's 3s
   poll can reliably catch and never show up in the UI. See DEPLOYMENT.md
   changelog #12.
+- The `_is_cancelled()` checkpoints scattered through `_run_analysis_pipeline`
+  (6 of them now) and the periodic mid-stream check inside `run_comparison()`'s
+  Claude loop — do NOT trim these back down to the original 2. Fewer
+  checkpoints means Cancel silently does nothing whenever it lands in an
+  uncovered stretch, confirmed as the actual live bug — see DEPLOYMENT.md
+  changelog #13.
 
 ---
 

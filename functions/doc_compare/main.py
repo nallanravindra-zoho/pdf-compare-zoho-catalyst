@@ -415,6 +415,7 @@ def _run_analysis_pipeline(context, job_id: str, quote_id: str, initiated_by: st
             raise Exception(f"Vendor Quote PDF is attached but has no file ID. Re-attach {VQ_PDF_FIELD}.")
 
         # ── Download PDFs in parallel ─────────────────────────
+        if _is_cancelled(context, job_id): return
         _phase(context, job_id, "Downloading PDF attachments...")
         # Cosmetic delay only — see note on the fetch-quote phase above; same
         # intra-network-vs-cross-cloud reasoning applies to these two calls.
@@ -430,6 +431,7 @@ def _run_analysis_pipeline(context, job_id: str, quote_id: str, initiated_by: st
             raise Exception(f"{VQ_PDF_FIELD} is not a valid PDF file.")
 
         # ── Gemini extraction in parallel ─────────────────────
+        if _is_cancelled(context, job_id): return
         _phase(context, job_id, "Extracting line items with Gemini AI...")
         gemini_model  = get_gemini_model()
         gemini_prompt = load_gemini_prompt(token)
@@ -445,7 +447,10 @@ def _run_analysis_pipeline(context, job_id: str, quote_id: str, initiated_by: st
         # ── Claude comparison ─────────────────────────────────
         _phase(context, job_id, "Comparing documents with Claude AI...")
         if _is_cancelled(context, job_id): return
-        result = run_comparison(zoho_text, ppo_text, vq_text, token)
+        result = run_comparison(zoho_text, ppo_text, vq_text, token, context=context, job_id=job_id)
+
+        # ── Cancellation check ────────────────────────────────
+        if _is_cancelled(context, job_id): return
 
         # ── Attach margin gate & subtotal validation ──────────
         result["margin_gate"] = {
@@ -465,6 +470,7 @@ def _run_analysis_pipeline(context, job_id: str, quote_id: str, initiated_by: st
         pdf_bytes = generate_pdf_report(result, quote.get("Subject", quote_id), initiated_by)
 
         # ── Attach PDF to quote ───────────────────────────────
+        if _is_cancelled(context, job_id): return
         _phase(context, job_id, "Attaching report to Zoho quote...")
         attach_pdf_to_quote(quote_id, pdf_bytes, token, report_name)
 
@@ -814,7 +820,8 @@ def extract_pdf_gemini(pdf_bytes: bytes, label: str, model_name: str, prompt: st
 # ═════════════════════════════════════════════════════════════
 # CLAUDE COMPARISON  (identical to app.py)
 # ═════════════════════════════════════════════════════════════
-def run_comparison(zoho_text: str, ppo_text: str, vq_text: str, token: str = "") -> dict:
+def run_comparison(zoho_text: str, ppo_text: str, vq_text: str, token: str = "",
+                    context=None, job_id: str = None) -> dict:
     import anthropic
     matching_prompt = load_claude_prompt(token)
     print(f"[claude] Prompt: {len(matching_prompt)} chars")
@@ -832,8 +839,19 @@ def run_comparison(zoho_text: str, ppo_text: str, vq_text: str, token: str = "")
             {"type": "text", "text": matching_prompt}
         ]}]
     ) as stream:
+        # Claude streaming is easily the single longest uninterruptible call
+        # in the pipeline (can run tens of seconds). Poll cancellation every
+        # ~2s of wall time (not every chunk — _is_cancelled hits DataStore,
+        # too expensive to check per-token) so a mid-stream cancel actually
+        # takes effect instead of running to completion regardless.
+        last_check = time.time()
         for chunk in stream.text_stream:
             full_text += chunk
+            if context is not None and job_id is not None and time.time() - last_check > 2:
+                last_check = time.time()
+                if _is_cancelled(context, job_id):
+                    print(f"[{job_id}] ❌ Cancelled mid-stream — abandoning Claude call")
+                    raise Exception("Cancelled by user")
         msg = stream.get_final_message()
         if msg.stop_reason == "max_tokens":
             raise Exception("Claude truncated — increase max_tokens")

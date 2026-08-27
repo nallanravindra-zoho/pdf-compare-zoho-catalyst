@@ -259,3 +259,35 @@ inference) are slow for reasons unrelated to network path, so they were
 unaffected. Added a 2s `time.sleep()` right after each of those two `_phase()`
 calls, purely so they're reliably visible — no functional change, ~4s of
 added latency total per run.
+
+### 2026-08-27 — Cancel button still didn't stop the job — closed the checkpoint gaps
+
+Reported: clicking Cancel in the widget had no effect — the job ran to
+completion regardless. Not a widget bug (didn't need `index.html` for this
+one) — a real backend gap. `_run_analysis_pipeline` only checked
+`_is_cancelled()` at **2 points** in the whole pipeline: before formatting the
+quote text, and right before the Claude call. Everything from Claude
+comparison onward (PDF generation, attach-to-quote) had **zero** further
+checks — a cancel click landing anywhere in that back half, or during the
+Claude call itself (often the single longest step, tens of seconds), was
+never observed and the job always finished.
+
+Fixed:
+- Added checkpoints before PDF download, before Gemini extraction, right
+  after Claude comparison, and before the final attach-to-quote call — 6
+  total now, one before/after every major phase transition.
+- Added a periodic cancellation check *inside* `run_comparison()`'s Claude
+  streaming loop — checks every ~2s of wall time (not every chunk;
+  `_is_cancelled()` is a live DataStore query, too expensive to run per-token)
+  so a cancel click during the actual Claude call can interrupt it instead of
+  waiting for the full response.
+- Confirmed the existing exception-handling guard in `_run_analysis_pipeline`
+  (`if _ds_read(...).get("status") != "cancelled": _ds_write(status=error)`)
+  already correctly treats a mid-stream cancellation as "already cancelled,
+  don't overwrite with error" — no new exception type needed, a plain
+  `raise Exception("Cancelled by user")` from inside the stream loop routes
+  through the same existing path correctly.
+
+Verified with a mocked test: a simulated cancel click at ~0.2s into an
+80-chunk/4s fake stream was caught and the call abandoned at the ~2s check
+mark, instead of running the full 4s to completion.
