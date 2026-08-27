@@ -64,13 +64,16 @@ import zcatalyst_sdk
 from flask import make_response, jsonify
 from io import BytesIO
 
-# anthropic, google.generativeai, and xhtml2pdf are deliberately NOT imported
+# anthropic, google.generativeai, and reportlab are deliberately NOT imported
 # here — they're heavy (google.generativeai alone measured 2.7s+ to import,
-# before even reaching its own native crypto deps; xhtml2pdf pulls in
-# pyhanko -> cryptography too, despite once being assumed "pure Python").
-# Importing them at module level meant EVERY cold start paid that cost even
-# for /job-status or /check-report, which never touch Gemini/Claude/PDF at
-# all. Imported lazily instead, inside the functions that actually use them.
+# before even reaching its own native crypto deps). Importing them at module
+# level meant EVERY cold start paid that cost even for /job-status or
+# /check-report, which never touch Gemini/Claude/PDF at all. Imported lazily
+# instead, inside the functions that actually use them.
+#
+# PDF generation used to go through xhtml2pdf (an HTML/CSS-to-PDF translation
+# layer) — replaced with direct ReportLab Platypus calls in
+# generate_pdf_report(); see that function's own header comment for why.
 
 
 # ─────────────────────────────────────────────
@@ -1013,300 +1016,387 @@ def check_subtotal_validation(quote, margin, ppo_header, vq_header) -> dict:
 
 
 # ═════════════════════════════════════════════════════════════
-# GENERATE PDF REPORT  (identical to app.py — full HTML template)
+# GENERATE PDF REPORT
+#
+# Built directly on ReportLab's Platypus API, NOT xhtml2pdf's HTML/CSS
+# translation layer. xhtml2pdf has no flexbox support at all (every
+# `display:flex` block in the old template silently collapsed into plain
+# inline text — confirmed live, that's why the currency cards ran together
+# with no spacing) and its table-layout width handling isn't reliable enough
+# to keep columns inside the printable page area (confirmed live: the
+# Status column ran off the page edge). ReportLab is already xhtml2pdf's own
+# PDF-drawing backend (`pip show xhtml2pdf` lists `reportlab` as a direct
+# dependency), so building against it directly costs zero extra memory —
+# it just removes the unreliable translation step that was causing both bugs.
+#
+# Base-14 PDF fonts (Helvetica/Courier) don't include glyphs like ✓ ⚠ ↔ —
+# rendering those silently drops the glyph. Deliberately using plain-ASCII
+# equivalents throughout instead of embedding a Unicode font just for a
+# handful of decorative symbols.
 # ═════════════════════════════════════════════════════════════
 def generate_pdf_report(result: dict, quote_subject: str, initiated_by: str = "") -> bytes:
-    from xhtml2pdf import pisa
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        HRFlowable, KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+    )
+
     print("Generating PDF report...")
     t0 = time.time()
 
-    def status_badge(status):
-        if not status or status == "-": return '<span class="pill pill-na">N/A</span>'
+    # ── Palette (matches the original design's hex values) ─────
+    NAVY   = colors.HexColor("#1a1a2e")
+    SLATE  = colors.HexColor("#374151")
+    GRAY   = colors.HexColor("#6b7280")
+    LGRAY  = colors.HexColor("#9ca3af")
+    HAIR   = colors.HexColor("#f3f4f6")
+    DASH   = colors.HexColor("#d1d5db")
+    SHADE  = colors.HexColor("#f8f8f8")
+    GREEN_BG, GREEN_TX, GREEN_BD = colors.HexColor("#d1fae5"), colors.HexColor("#065f46"), colors.HexColor("#6ee7b7")
+    AMBER_BG, AMBER_TX, AMBER_BD = colors.HexColor("#fef3c7"), colors.HexColor("#92400e"), colors.HexColor("#fcd34d")
+    RED_BG,   RED_TX,   RED_BD   = colors.HexColor("#fee2e2"), colors.HexColor("#991b1b"), colors.HexColor("#ef4444")
+    NA_BG,    NA_TX               = colors.HexColor("#f3f4f6"), colors.HexColor("#9ca3af")
+
+    PAGE_W = landscape(A4)[0] - 24 * mm  # usable width inside 12mm margins
+
+    def status_style(status):
+        """Mirrors the widget's own statusPill() classification."""
+        if not status or status == "-":
+            return NA_BG, NA_TX, "N/A"
         s = status.lower()
-        if "mismatch"  in s: return '<span class="pill pill-miss">Mismatch</span>'
-        if "not found" in s: return '<span class="pill pill-review">Not Found</span>'
-        if "review"    in s: return '<span class="pill pill-review">Review</span>'
-        if "match"     in s: return '<span class="pill pill-match">Match</span>'
-        return f'<span class="pill pill-na">{status}</span>'
+        if "mismatch"  in s: return RED_BG,   RED_TX,   "Mismatch"
+        if "not found" in s: return AMBER_BG, AMBER_TX, "Not Found"
+        if "review"    in s: return AMBER_BG, AMBER_TX, "Review"
+        if "match"     in s: return GREEN_BG, GREEN_TX, "Match"
+        return NA_BG, NA_TX, status
 
-    fc = (result.get("final_call") or "").upper()
-    if "CLEAR" in fc:   banner_bg, banner_border = "#d1fae5", "#10b981"
-    elif "HOLD" in fc:  banner_bg, banner_border = "#fee2e2", "#ef4444"
-    else:               banner_bg, banner_border = "#fef3c7", "#f59e0b"
+    # ── Styles ───────────────────────────────────────────────────
+    title_style     = ParagraphStyle("title", fontName="Helvetica-Bold", fontSize=16, textColor=NAVY,
+                                      leading=20, spaceAfter=4)
+    subtitle_style  = ParagraphStyle("subtitle", fontName="Helvetica", fontSize=8, textColor=GRAY)
+    card_title      = ParagraphStyle("card_title", fontName="Helvetica-Bold", fontSize=8, textColor=SLATE,
+                                      spaceBefore=2, spaceAfter=3)
+    th_style        = ParagraphStyle("th", fontName="Helvetica-Bold", fontSize=7, textColor=colors.white)
+    td_style        = ParagraphStyle("td", fontName="Helvetica", fontSize=7.5, textColor=NAVY, leading=10)
+    td_mono         = ParagraphStyle("td_mono", fontName="Courier", fontSize=7.5, textColor=NAVY, leading=10)
+    td_gray         = ParagraphStyle("td_gray", fontName="Helvetica", fontSize=7, textColor=GRAY, leading=9)
+    td_bold         = ParagraphStyle("td_bold", fontName="Helvetica-Bold", fontSize=7.5, textColor=SLATE)
+    td_sub          = ParagraphStyle("td_sub", fontName="Helvetica", fontSize=6.5, textColor=GRAY, leftIndent=6)
+    td_dash         = ParagraphStyle("td_dash", fontName="Courier", fontSize=7.5, textColor=DASH)
+    col_hdr_style   = ParagraphStyle("col_hdr", fontName="Helvetica-Bold", fontSize=6, textColor=LGRAY)
+    pill_style      = ParagraphStyle("pill", fontName="Helvetica-Bold", fontSize=6.5, leading=8, alignment=TA_CENTER)
+    banner_title    = ParagraphStyle("banner_title", fontName="Helvetica-Bold", fontSize=10, textColor=NAVY)
+    banner_detail   = ParagraphStyle("banner_detail", fontName="Helvetica", fontSize=7.5, textColor=SLATE, leading=11)
+    overall_style   = ParagraphStyle("overall", fontName="Helvetica", fontSize=8, textColor=SLATE, leading=12)
 
-    fc_details = "".join([f"<li>{d}</li>" for d in (result.get("final_call_detail") or [])])
+    def pill(status):
+        """Small fixed-width colored badge — a 1-cell Table so it can sit inside any other cell."""
+        bg, tx, label = status_style(status)
+        p = Paragraph(label, ParagraphStyle("pill_c", parent=pill_style, textColor=tx))
+        t = Table([[p]], colWidths=[19 * mm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), bg),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        return t
 
-    # Margin gate banner
+    def colored_block(flowables, bg, accent):
+        """A full-width colored banner with a thick left accent bar, replacing the old
+        `border-left: Npx solid ...; background: ...` div pattern."""
+        t = Table([[f] for f in flowables], colWidths=[PAGE_W])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), bg),
+            ("LINEBEFORE", (0, 0), (0, -1), 3.5, accent),
+            ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        return t
+
+    def section_title(text):
+        return [Paragraph(text, card_title), HRFlowable(width=PAGE_W, thickness=1.2, color=HAIR, spaceAfter=4)]
+
+    story = []
+
+    # ── Header ───────────────────────────────────────────────────
+    story.append(Paragraph("Procurement Analysis Report", title_style))
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    by_line = f"  |  Initiated by: {initiated_by}" if initiated_by else ""
+    story.append(Paragraph(f"Quote: {quote_subject}  |  Generated: {generated_at}{by_line}", subtitle_style))
+    story.append(Spacer(1, 4 * mm))
+
+    # ── Margin gate banner ──────────────────────────────────────
     mg = result.get("margin_gate") or {}
-    margin_status_block = ""
     if mg.get("checked"):
         gm, vm = mg.get("gross_margin"), mg.get("vendor_margin")
+        gm_s = f"{gm}%" if gm is not None else "—"
+        vm_s = f"{vm}%" if vm is not None else "—"
         if mg.get("needs_review"):
-            margin_status_block = f"""<div class="margin-needs-review-banner">
-            <div class="mnr-title">&#9888; Margin Check — Needs Review</div>
-            <p class="mnr-detail">Gross Margin ({gm if gm is not None else "—"}%) is less than
-            Minimum Vendor Margin ({vm if vm is not None else "—"}%) — flagged for review.</p>
-            <div class="margin-stats-pdf">
-              <div class="ms-item"><span class="ms-label">Opportunity</span><span class="ms-value">{mg.get("opportunity_name") or "—"}</span></div>
-              <div class="ms-item"><span class="ms-label">Vendor</span><span class="ms-value">{mg.get("vendor_name") or "—"}</span></div>
-              <div class="ms-item"><span class="ms-label">Gross Margin</span><span class="ms-value" style="color:#b91c1c">{gm if gm is not None else "—"}%</span></div>
-              <div class="ms-item"><span class="ms-label">Min Vendor Margin</span><span class="ms-value" style="color:#065f46">{vm if vm is not None else "—"}%</span></div>
-            </div></div>"""
+            lines = [
+                Paragraph("Margin Check — Needs Review",
+                          ParagraphStyle("mnr_title", fontName="Helvetica-Bold", fontSize=9, textColor=AMBER_TX)),
+                Paragraph(f"Gross Margin ({gm_s}) is less than Minimum Vendor Margin ({vm_s}) — flagged for review.",
+                          ParagraphStyle("mnr_detail", fontName="Helvetica", fontSize=7.5,
+                                         textColor=colors.HexColor("#78350f"))),
+                Paragraph(f"Opportunity: {mg.get('opportunity_name') or '—'}   |   Vendor: {mg.get('vendor_name') or '—'}",
+                          ParagraphStyle("mnr_stats", fontName="Courier", fontSize=7.5,
+                                         textColor=colors.HexColor("#78350f"))),
+            ]
+            story.append(colored_block(lines, AMBER_BG, AMBER_BD))
         else:
-            margin_status_block = f"""<div class="margin-pass-banner">
-            <span class="mp-title">&#10003; Margin check passed</span>
-            <span class="mp-stat"><span class="mp-label">Gross Margin</span>{gm if gm is not None else "—"}%</span>
-            <span class="mp-stat"><span class="mp-label">Min Vendor Margin</span>{vm if vm is not None else "—"}%</span>
-            </div>"""
+            line = Paragraph(f"Margin check passed  —  Gross Margin: {gm_s}   |   Min Vendor Margin: {vm_s}",
+                              ParagraphStyle("mp", fontName="Helvetica-Bold", fontSize=8, textColor=GREEN_TX))
+            story.append(colored_block([line], GREEN_BG, GREEN_BD))
+        story.append(Spacer(1, 4 * mm))
 
-    # Currency block
+    # ── Currency overview ────────────────────────────────────────
     currencies = result.get("currencies_detected") or {}
     qc  = currencies.get("quote_currency") or "—"
     ppc = currencies.get("partner_po_currency") or "—"
     vqc = currencies.get("vendor_quote_currency") or "—"
     cur_notes = currencies.get("notes") or ""
-    currency_block = f"""<div class="card currency-card">
-        <div class="card-title">Currency Overview</div>
-        <div class="currency-row">
-          <div class="currency-item"><span class="currency-tag-label">Zoho Quote</span><span class="currency-tag-value">{qc}</span></div>
-          <div class="currency-item"><span class="currency-tag-label">Partner PO</span><span class="currency-tag-value">{ppc}</span></div>
-          <div class="currency-item"><span class="currency-tag-label">Vendor Quote</span><span class="currency-tag-value">{vqc}</span></div>
-        </div>
-        {f'<p class="currency-notes">{cur_notes}</p>' if cur_notes else ""}
-      </div>"""
 
-    # Document header validation block
+    story.extend(section_title("CURRENCY OVERVIEW"))
+    label_style = ParagraphStyle("cur_label", fontName="Helvetica-Bold", fontSize=6, textColor=LGRAY)
+    value_style = ParagraphStyle("cur_value", fontName="Courier-Bold", fontSize=11, textColor=NAVY)
+    gap = 4 * mm
+    item_w = (PAGE_W - 2 * gap) / 3.0
+    cur_table = Table(
+        [[Paragraph("ZOHO QUOTE", label_style), "", Paragraph("PARTNER PO", label_style), "",
+          Paragraph("VENDOR QUOTE", label_style)],
+         [Paragraph(qc, value_style), "", Paragraph(ppc, value_style), "", Paragraph(vqc, value_style)]],
+        colWidths=[item_w, gap, item_w, gap, item_w],
+    )
+    cur_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), HAIR), ("BACKGROUND", (2, 0), (2, -1), HAIR), ("BACKGROUND", (4, 0), (4, -1), HAIR),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, 0), 4), ("BOTTOMPADDING", (0, 0), (-1, 0), 1),
+        ("TOPPADDING", (0, 1), (-1, 1), 0), ("BOTTOMPADDING", (0, 1), (-1, 1), 5),
+    ]))
+    story.append(cur_table)
+    if cur_notes:
+        story.append(Spacer(1, 2))
+        story.append(Paragraph(cur_notes, td_gray))
+    story.append(Spacer(1, 5 * mm))
+
+    # ── Document header validation ──────────────────────────────
     dhv = result.get("document_header_validation") or {}
-    def _dhv_row(label, fd):
-        if not fd: return ""
-        return (f"<tr><td style='font-weight:600;font-size:9px'>{label}</td>"
-                f"<td style='font-size:9px;font-family:monospace'>{fd.get('zq_value') or '—'}</td>"
-                f"<td style='font-size:9px;font-family:monospace'>{fd.get('pdf_value') or '—'}</td>"
-                f"<td style='text-align:center'>{status_badge(fd.get('status'))}</td>"
-                f"<td style='font-size:9px;color:#6b7280'>{fd.get('note') or ''}</td></tr>")
-    dhv_rows = (_dhv_row("Reseller", dhv.get("reseller"))
-              + _dhv_row("Partner PO Ref", dhv.get("partner_po_ref"))
-              + _dhv_row("Vendor", dhv.get("vendor"))
-              + _dhv_row("Vendor Quote Ref", dhv.get("vendor_quote_ref")))
-    header_validation_block = ""
-    if dhv_rows:
-        header_validation_block = f"""<div class="card">
-        <div class="card-title">Document Header Validation</div>
-        <table><thead><tr>
-          <th style="width:110px">Field</th>
-          <th style="width:170px">Zoho Quote Value</th>
-          <th style="width:170px">PDF Extracted Value</th>
-          <th style="width:82px;text-align:center">Status</th>
-          <th>Note</th>
-        </tr></thead><tbody>{dhv_rows}</tbody></table></div>"""
 
-    # SKU blocks
-    def sku_block(r, i):
-        row_bg = "#ffffff" if i % 2 == 0 else "#f9fafb"
-        all_s  = [r.get(f,"") for f in ("zq_status","vq_status","ppo_status","list_price_comparison_status","buy_price_comparison_status")]
-        worst  = "match"
+    def dhv_row(label, fd):
+        if not fd:
+            return None
+        return [Paragraph(label, td_bold), Paragraph(str(fd.get("zq_value") or "—"), td_mono),
+                Paragraph(str(fd.get("pdf_value") or "—"), td_mono), pill(fd.get("status")),
+                Paragraph(fd.get("note") or "", td_gray)]
+
+    dhv_rows = [r for r in [
+        dhv_row("Reseller", dhv.get("reseller")),
+        dhv_row("Partner PO Ref", dhv.get("partner_po_ref")),
+        dhv_row("Vendor", dhv.get("vendor")),
+        dhv_row("Vendor Quote Ref", dhv.get("vendor_quote_ref")),
+    ] if r]
+
+    if dhv_rows:
+        story.extend(section_title("DOCUMENT HEADER VALIDATION"))
+        header_row = [Paragraph("Field", th_style), Paragraph("Zoho Quote Value", th_style),
+                      Paragraph("PDF Extracted Value", th_style), Paragraph("Status", th_style),
+                      Paragraph("Note", th_style)]
+        widths = [35 * mm, 55 * mm, 55 * mm, 22 * mm, PAGE_W - 167 * mm]
+        tbl = Table([header_row] + dhv_rows, colWidths=widths, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, HAIR),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 5 * mm))
+
+    # ── Final call banner ────────────────────────────────────────
+    fc = (result.get("final_call") or "").upper()
+    if "CLEAR" in fc:  fc_bg, fc_bd = GREEN_BG, GREEN_BD
+    elif "HOLD" in fc: fc_bg, fc_bd = RED_BG, RED_BD
+    else:              fc_bg, fc_bd = AMBER_BG, AMBER_BD
+
+    fc_lines = [Paragraph(result.get("final_call", "") or "", banner_title)]
+    for d in (result.get("final_call_detail") or []):
+        fc_lines.append(Paragraph(f"–  {d}", banner_detail))
+    story.append(colored_block(fc_lines, fc_bg, fc_bd))
+    story.append(Spacer(1, 5 * mm))
+
+    # ── Section 1 — Three-way item matching ─────────────────────
+    story.extend(section_title("SECTION 1 — THREE-WAY ITEM MATCHING"))
+
+    def sku_header(r, i):
+        num, code = str(r.get("num") or i + 1), r.get("sku") or "—"
+        all_s = [r.get(f, "") for f in
+                 ("zq_status", "vq_status", "ppo_status", "list_price_comparison_status", "buy_price_comparison_status")]
+        worst = "match"
         for s in all_s:
             sl = (s or "").lower()
             if "mismatch" in sl: worst = "mismatch"; break
-            if "review"   in sl and worst != "mismatch": worst = "review"
-        if worst == "mismatch": pb,pc,pl = "#fee2e2","#991b1b","Mismatch"
-        elif worst == "review": pb,pc,pl = "#fef3c7","#92400e","Review"
-        else:                   pb,pc,pl = "#d1fae5","#065f46","Match"
-        overall_pill = f'<span class="pill" style="background:{pb};color:{pc}">{pl}</span>'
+            if "review" in sl and worst != "mismatch": worst = "review"
+        overall_status = {"mismatch": "Mismatch", "review": "Review", "match": "Match"}[worst]
+        left = Paragraph(f'<font color="#9ca3af" size="7">{num}.</font>  <font color="white"><b>{code}</b></font>',
+                          ParagraphStyle("sku_left", fontName="Courier", fontSize=8))
+        t = Table([[left, pill(overall_status)]], colWidths=[PAGE_W - 25 * mm, 25 * mm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), NAVY),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+            ("LEFTPADDING", (0, 0), (0, 0), 8), ("RIGHTPADDING", (1, 0), (1, 0), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        return t
+
+    def sku_detail(r):
         zqq  = str(r.get("zq_qty"))  if r.get("zq_qty")  is not None else "-"
         vqq  = str(r.get("vq_qty"))  if r.get("vq_qty")  is not None else "-"
         ppoq = str(r.get("ppo_qty")) if r.get("ppo_qty") is not None else "-"
         all_qty_match = all(
             ("match" in (r.get(f) or "").lower() and "mismatch" not in (r.get(f) or "").lower())
-            for f in ["zq_status","vq_status","ppo_status"]
+            for f in ["zq_status", "vq_status", "ppo_status"]
         )
         if all_qty_match:
-            qty_row = f"""<tr><td class="rl">Qty</td>
-              <td class="cv">{zqq}</td><td class="cv">{ppoq}</td><td class="cv">{vqq}</td>
-              <td class="sc">{status_badge("Match")}</td></tr>"""
+            qty_status = pill("Match")
         else:
-            qty_row = f"""<tr><td class="rl">Qty</td>
-              <td class="cv">{zqq}</td><td class="cv">{ppoq}</td><td class="cv">{vqq}</td>
-              <td class="sc">
-                <div style="font-size:7px;color:#6b7280">ZQ&#8596;PPO {status_badge(r.get("zq_status"))}</div>
-                <div style="font-size:7px;color:#6b7280">ZQ&#8596;VQ&nbsp;&nbsp;{status_badge(r.get("vq_status"))}</div>
-                <div style="font-size:7px;color:#6b7280">PPO&#8596;VQ {status_badge(r.get("ppo_status"))}</div>
-              </td></tr>"""
+            qs = Table([
+                [Paragraph("ZQ<->PPO", td_gray), pill(r.get("zq_status"))],
+                [Paragraph("ZQ<->VQ",  td_gray), pill(r.get("vq_status"))],
+                [Paragraph("PPO<->VQ", td_gray), pill(r.get("ppo_status"))],
+            ], colWidths=[22 * mm, 19 * mm])
+            qs.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 1), ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+            ]))
+            qty_status = qs
+
+        rows = [
+            ["", Paragraph("ZQ", th_style), Paragraph("PPO", th_style), Paragraph("VQ", th_style),
+             Paragraph("Status", th_style)],
+            [Paragraph("Qty", td_bold), Paragraph(zqq, td_mono), Paragraph(ppoq, td_mono), Paragraph(vqq, td_mono),
+             qty_status],
+            [Paragraph("Price", td_bold), Paragraph("ZQ", col_hdr_style), Paragraph("PPO", col_hdr_style),
+             Paragraph("VQ", col_hdr_style), ""],
+            [Paragraph("List Price", td_sub), Paragraph(str(r.get("list_price_zq") or "-"), td_mono),
+             Paragraph(str(r.get("partner_ppo_price_original") or "-"), td_mono),
+             Paragraph("—", td_dash), pill(r.get("list_price_comparison_status"))],
+            [Paragraph("Buy Price", td_sub), Paragraph(str(r.get("buy_price_zq") or "-"), td_mono),
+             Paragraph("—", td_dash), Paragraph(str(r.get("vendor_quote_price") or "-"), td_mono),
+             pill(r.get("buy_price_comparison_status"))],
+        ]
         note = (r.get("notes") or "").strip()
-        note_row = f"""<tr><td class="rl">Notes</td>
-          <td colspan="4" style="font-size:8px;color:#6b7280;line-height:1.4">{note}</td></tr>""" if note else ""
-        return f"""<div class="sku-block" style="background:{row_bg}">
-          <div class="sku-hdr">
-            <span class="sku-num">{r.get("num") or i+1}</span>
-            <span class="sku-code">{r.get("sku") or "—"}</span>
-            <span style="margin-left:auto">{overall_pill}</span>
-          </div>
-          <table class="dt"><thead><tr>
-            <th style="width:65px"></th><th>ZQ</th><th>PPO</th><th>VQ</th>
-            <th style="width:110px;text-align:center">Status</th>
-          </tr></thead><tbody>
-            {qty_row}
-            <tr style="background:#f8f8f8">
-              <td class="rl">Price</td>
-              <td class="cv" style="font-size:7px;color:#9ca3af;font-weight:600">ZQ</td>
-              <td class="cv" style="font-size:7px;color:#9ca3af;font-weight:600">PPO</td>
-              <td class="cv" style="font-size:7px;color:#9ca3af;font-weight:600">VQ</td>
-              <td></td>
-            </tr>
-            <tr style="background:#f8f8f8">
-              <td class="rl sub">List&nbsp;Price</td>
-              <td class="cv">{r.get("list_price_zq") or "-"}</td>
-              <td class="cv">{r.get("partner_ppo_price_original") or "-"}</td>
-              <td class="cv" style="color:#d1d5db">—</td>
-              <td class="sc">{status_badge(r.get("list_price_comparison_status"))}</td>
-            </tr>
-            <tr style="background:#f8f8f8">
-              <td class="rl sub">Buy&nbsp;Price</td>
-              <td class="cv">{r.get("buy_price_zq") or "-"}</td>
-              <td class="cv" style="color:#d1d5db">—</td>
-              <td class="cv">{r.get("vendor_quote_price") or "-"}</td>
-              <td class="sc">{status_badge(r.get("buy_price_comparison_status"))}</td>
-            </tr>
-            {note_row}
-          </tbody></table></div>"""
+        span_style = []
+        if note:
+            rows.append([Paragraph("Notes", td_bold), Paragraph(note, td_gray), "", "", ""])
+            span_style = [("SPAN", (1, 5), (4, 5))]
 
-    sku_blocks = "".join(sku_block(r, i) for i, r in enumerate(result.get("matching_table", [])))
+        label_w, val_w = 22 * mm, 32 * mm
+        widths = [label_w, val_w, val_w, val_w, PAGE_W - label_w - 3 * val_w]
+        tbl = Table(rows, colWidths=widths)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), SLATE),
+            ("BACKGROUND", (0, 2), (-1, 4), SHADE),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LINEBELOW", (0, 0), (-1, -2), 0.5, HAIR),
+        ] + span_style))
+        return tbl
 
-    # Subtotal validation block
+    for i, r in enumerate(result.get("matching_table", [])):
+        story.append(KeepTogether([sku_header(r, i), sku_detail(r), Spacer(1, 2.5 * mm)]))
+
+    story.append(Spacer(1, 3 * mm))
+
+    # ── Subtotal validation ──────────────────────────────────────
     sv = result.get("subtotal_validation") or {}
-    subtotal_validation_block = ""
-    if sv:
-        def _sv_row(d):
-            if not d: return ""
-            pu  = d.get("pdf_subtotal_usd")
-            ov  = d.get("opportunity_value")
-            pr  = d.get("pdf_subtotal")
-            pus = f"${pu:,.2f}" if pu is not None else "—"
-            ovs = f"${ov:,.2f}" if ov is not None else "—"
-            prs = f"{pr:,.2f} {d.get('pdf_currency') or ''}".strip() if pr is not None else "—"
-            return (f"<tr>"
-                    f"<td style='font-weight:600;font-size:9px'>{d.get('label','')}</td>"
-                    f"<td style='font-size:9px;font-family:monospace'>{prs}</td>"
-                    f"<td style='font-size:9px;font-family:monospace'>{pus}</td>"
-                    f"<td style='font-size:9px;font-family:monospace'>{ovs}</td>"
-                    f"<td style='text-align:center'>{status_badge(d.get('status'))}</td></tr>")
-        sv_rows = _sv_row(sv.get("partner_po")) + _sv_row(sv.get("vendor_quote"))
-        subtotal_validation_block = f"""<div class="card">
-        <div class="card-title">Subtotal Validation (vs Opportunity)</div>
-        <table><thead><tr>
-          <th style="width:220px">Check</th>
-          <th style="width:140px">PDF Subtotal</th>
-          <th style="width:100px">Converted (USD)</th>
-          <th style="width:120px">Opportunity Value</th>
-          <th style="width:82px;text-align:center">Status</th>
-        </tr></thead><tbody>{sv_rows}</tbody></table>
-        <p style="font-size:9px;color:#374151;margin-top:6px">Overall: {status_badge(sv.get("overall_status"))}</p>
-      </div>"""
 
-    must_resolve = "".join([f'<li class="item-red">{i}</li>'   for i in (result.get("must_resolve")    or [])]) or '<li style="color:#6b7280;font-style:italic">None — all items cleared</li>'
-    needs_review = "".join([f'<li class="item-amber">{i}</li>' for i in (result.get("needs_review")    or [])]) or '<li style="color:#6b7280;font-style:italic">None — no items flagged for review</li>'
-    unmatched    = "".join([f'<span class="tag">{i}</span>'    for i in (result.get("unmatched_items") or [])])
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    by_line      = f" &nbsp;|&nbsp; Initiated by: {initiated_by}" if initiated_by else ""
+    def sv_row(d):
+        if not d:
+            return None
+        pu, ov, pr = d.get("pdf_subtotal_usd"), d.get("opportunity_value"), d.get("pdf_subtotal")
+        pus = f"${pu:,.2f}" if pu is not None else "—"
+        ovs = f"${ov:,.2f}" if ov is not None else "—"
+        prs = f"{pr:,.2f} {d.get('pdf_currency') or ''}".strip() if pr is not None else "—"
+        return [Paragraph(d.get("label", ""), td_bold), Paragraph(prs, td_mono), Paragraph(pus, td_mono),
+                Paragraph(ovs, td_mono), pill(d.get("status"))]
 
-    html_content = f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"/>
-<style>
-  @page {{ size: A4 landscape; margin: 12mm; }}
-  @page {{ -pdf-page-size: A4 landscape; }}
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: Arial, Helvetica, sans-serif; font-size: 11px; color: #1a1a2e; background: #f4f6f9; }}
-  .header {{ margin-bottom: 12px; }}
-  .header h1 {{ font-size: 18px; font-weight: bold; color: #1a1a2e; margin-bottom: 2px; }}
-  .header .subtitle {{ font-size: 9px; color: #6b7280; }}
-  .banner {{ border-radius: 6px; padding: 9px 12px; margin-bottom: 12px; border-left: 5px solid {banner_border}; background: {banner_bg}; }}
-  .banner-title {{ font-weight: bold; font-size: 12px; color: #1a1a2e; margin-bottom: 3px; }}
-  .banner ul {{ list-style: none; padding: 0; margin: 0; }}
-  .banner ul li {{ font-size: 9px; color: #374151; padding: 1px 0; line-height: 1.5; }}
-  .banner ul li:before {{ content: "- "; }}
-  .card {{ background: #fff; border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; border: 1px solid #e5e7eb; }}
-  .card-title {{ font-size: 9px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.06em; color: #374151; border-bottom: 2px solid #f3f4f6; padding-bottom: 5px; margin-bottom: 8px; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 9px; }}
-  thead th {{ background: #1a1a2e; color: #fff; padding: 6px 7px; text-align: left; font-weight: 600; font-size: 8px; text-transform: uppercase; letter-spacing: 0.04em; }}
-  tbody td {{ padding: 5px 7px; border-bottom: 1px solid #f3f4f6; vertical-align: top; line-height: 1.4; }}
-  .pill {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 8px; font-weight: 600; }}
-  .pill-match  {{ background: #d1fae5; color: #065f46; }}
-  .pill-review {{ background: #fef3c7; color: #92400e; }}
-  .pill-miss   {{ background: #fee2e2; color: #991b1b; }}
-  .pill-na     {{ background: #f3f4f6; color: #9ca3af; }}
-  .sku-block  {{ border: 1px solid #e5e7eb; border-radius: 5px; margin-bottom: 6px; overflow: hidden; }}
-  .sku-hdr    {{ display: flex; align-items: center; gap: 8px; padding: 5px 8px; background: #1a1a2e; color: #fff; }}
-  .sku-num    {{ font-size: 8px; color: #9ca3af; min-width: 14px; }}
-  .sku-code   {{ font-family: monospace; font-size: 9px; font-weight: 700; color: #fff; }}
-  .dt         {{ width: 100%; border-collapse: collapse; font-size: 8px; }}
-  .dt thead th {{ background: #374151; color: #fff; padding: 4px 6px; text-align: left; font-size: 7px; font-weight: 600; text-transform: uppercase; }}
-  .dt tbody td {{ padding: 4px 6px; border-bottom: 1px solid #f3f4f6; vertical-align: middle; }}
-  .dt .rl     {{ font-weight: 700; color: #374151; font-size: 8px; white-space: nowrap; }}
-  .dt .rl.sub {{ font-weight: 400; color: #6b7280; padding-left: 14px; font-size: 7px; }}
-  .dt .cv     {{ font-family: monospace; font-size: 8px; color: #1a1a2e; }}
-  .dt .sc     {{ text-align: left; }}
-  .summary-label {{ font-weight: bold; font-size: 9px; margin: 7px 0 3px 0; }}
-  .label-red   {{ color: #ef4444; }}
-  .label-amber {{ color: #f59e0b; }}
-  .label-green {{ color: #10b981; }}
-  ul.summary-list {{ list-style: none; padding: 0; margin: 0 0 5px 0; }}
-  ul.summary-list li {{ font-size: 9px; color: #374151; line-height: 1.5; padding: 2px 0 2px 8px; margin-bottom: 2px; }}
-  li.item-red   {{ border-left: 3px solid #ef4444; }}
-  li.item-amber {{ border-left: 3px solid #f59e0b; }}
-  .tag {{ display: inline-block; background: #fee2e2; color: #991b1b; border-radius: 3px; padding: 1px 5px; font-size: 8px; margin: 2px; font-family: monospace; }}
-  .overall-text {{ font-size: 9px; color: #374151; line-height: 1.6; }}
-  .currency-card {{ padding-bottom: 10px; }}
-  .currency-row {{ display: flex; gap: 12px; margin-bottom: 6px; }}
-  .currency-item {{ background: #f4f6f9; border-radius: 5px; padding: 5px 10px; display: flex; flex-direction: column; gap: 1px; }}
-  .currency-tag-label {{ font-size: 7px; text-transform: uppercase; letter-spacing: 0.05em; color: #9ca3af; font-weight: 700; }}
-  .currency-tag-value {{ font-size: 11px; font-weight: 700; color: #1a1a2e; font-family: monospace; }}
-  .currency-notes {{ font-size: 9px; color: #374151; line-height: 1.5; border-top: 1px solid #f3f4f6; padding-top: 6px; margin-top: 4px; }}
-  .margin-pass-banner {{ background: #d1fae5; border: 1px solid #6ee7b7; border-radius: 6px; padding: 7px 12px; margin-bottom: 12px; font-size: 9px; color: #065f46; display: flex; align-items: center; gap: 16px; }}
-  .margin-pass-banner .mp-title {{ font-weight: bold; }}
-  .margin-pass-banner .mp-stat {{ font-family: monospace; font-weight: 600; }}
-  .margin-pass-banner .mp-label {{ font-family: Arial, Helvetica, sans-serif; font-weight: normal; color: #047857; margin-right: 3px; }}
-  .margin-needs-review-banner {{ background: #fef3c7; border: 1px solid #fcd34d; border-radius: 6px; padding: 8px 12px; margin-bottom: 12px; color: #92400e; }}
-  .margin-needs-review-banner .mnr-title {{ font-weight: bold; font-size: 10px; margin-bottom: 3px; }}
-  .margin-needs-review-banner .mnr-detail {{ font-size: 9px; color: #78350f; line-height: 1.5; margin-bottom: 6px; }}
-  .margin-stats-pdf {{ display: flex; gap: 10px; flex-wrap: wrap; }}
-  .margin-stats-pdf .ms-item {{ background: rgba(255,255,255,0.6); border-radius: 5px; padding: 4px 9px; display: flex; flex-direction: column; gap: 1px; min-width: 90px; }}
-  .margin-stats-pdf .ms-label {{ font-size: 7px; text-transform: uppercase; letter-spacing: 0.05em; color: #78350f; font-weight: 700; }}
-  .margin-stats-pdf .ms-value {{ font-size: 10px; font-weight: 700; color: #1a1a2e; font-family: monospace; }}
-</style>
-</head>
-<body>
-  <div class="header">
-    <h1>Procurement Analysis Report</h1>
-    <div class="subtitle">Quote: {quote_subject} &nbsp;|&nbsp; Generated: {generated_at}{by_line}</div>
-  </div>
-  {margin_status_block}
-  {currency_block}
-  {header_validation_block}
-  <div class="banner">
-    <div class="banner-title">{result.get("final_call","")}</div>
-    <ul>{fc_details}</ul>
-  </div>
-  <div class="card">
-    <div class="card-title">Section 1 - Three-Way Item Matching</div>
-    {sku_blocks}
-  </div>
-  {subtotal_validation_block}
-  <div class="card">
-    <div class="card-title">Section 2 - Summary</div>
-    <div class="summary-label label-red">Must Resolve Before Processing</div>
-    <ul class="summary-list">{must_resolve}</ul>
-    <div class="summary-label label-amber">Needs Human Review</div>
-    <ul class="summary-list">{needs_review}</ul>
-    {"<div class='summary-label label-red'>Unmatched Items</div><div>" + unmatched + "</div>" if unmatched else ""}
-    <div class="summary-label label-green">Overall</div>
-    <p class="overall-text">{result.get("overall_summary","")}</p>
-  </div>
-</body></html>"""
+    sv_rows = [r for r in [sv_row(sv.get("partner_po")), sv_row(sv.get("vendor_quote"))] if r]
+    if sv_rows:
+        story.extend(section_title("SUBTOTAL VALIDATION (VS OPPORTUNITY)"))
+        header_row = [Paragraph("Check", th_style), Paragraph("PDF Subtotal", th_style),
+                      Paragraph("Converted (USD)", th_style), Paragraph("Opportunity Value", th_style),
+                      Paragraph("Status", th_style)]
+        widths = [75 * mm, 45 * mm, 40 * mm, 40 * mm, PAGE_W - 200 * mm]
+        tbl = Table([header_row] + sv_rows, colWidths=widths)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, HAIR),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 2 * mm))
+        story.append(Table([[Paragraph("Overall:", td_bold), pill(sv.get("overall_status"))]],
+                            colWidths=[20 * mm, 22 * mm]))
+        story.append(Spacer(1, 5 * mm))
 
+    # ── Section 2 — Summary ──────────────────────────────────────
+    story.extend(section_title("SECTION 2 — SUMMARY"))
+
+    def summary_list(items, accent, empty_text):
+        if not items:
+            return [Paragraph(empty_text, ParagraphStyle("empty", fontName="Helvetica-Oblique", fontSize=7.5, textColor=GRAY))]
+        out = []
+        for it in items:
+            t = Table([[Paragraph(it, ParagraphStyle("sitem", fontName="Helvetica", fontSize=7.5,
+                                                       textColor=SLATE, leftIndent=4))]], colWidths=[PAGE_W])
+            t.setStyle(TableStyle([
+                ("LINEBEFORE", (0, 0), (0, 0), 2.5, accent),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]))
+            out.append(t)
+            out.append(Spacer(1, 1))
+        return out
+
+    story.append(Paragraph("Must Resolve Before Processing",
+                            ParagraphStyle("lbl_red", fontName="Helvetica-Bold", fontSize=8, textColor=RED_BD)))
+    story.extend(summary_list(result.get("must_resolve") or [], RED_BD, "None — all items cleared"))
+    story.append(Spacer(1, 3 * mm))
+
+    story.append(Paragraph("Needs Human Review",
+                            ParagraphStyle("lbl_amber", fontName="Helvetica-Bold", fontSize=8, textColor=colors.HexColor("#f59e0b"))))
+    story.extend(summary_list(result.get("needs_review") or [], colors.HexColor("#f59e0b"), "None — no items flagged for review"))
+    story.append(Spacer(1, 3 * mm))
+
+    unmatched = result.get("unmatched_items") or []
+    if unmatched:
+        story.append(Paragraph("Unmatched Items",
+                                ParagraphStyle("lbl_red2", fontName="Helvetica-Bold", fontSize=8, textColor=RED_BD)))
+        story.append(Paragraph(", ".join(unmatched),
+                                ParagraphStyle("tags", fontName="Courier", fontSize=7.5, textColor=RED_TX)))
+        story.append(Spacer(1, 3 * mm))
+
+    story.append(Paragraph("Overall",
+                            ParagraphStyle("lbl_green", fontName="Helvetica-Bold", fontSize=8, textColor=colors.HexColor("#10b981"))))
+    story.append(Paragraph(result.get("overall_summary", "") or "", overall_style))
+
+    # ── Build ────────────────────────────────────────────────────
     buf = BytesIO()
-    pisa_status = pisa.CreatePDF(html_content, dest=buf)
-    if pisa_status.err:
-        raise Exception(f"xhtml2pdf error: {pisa_status.err}")
+    doc = SimpleDocTemplate(
+        buf, pagesize=landscape(A4),
+        leftMargin=12 * mm, rightMargin=12 * mm, topMargin=12 * mm, bottomMargin=12 * mm,
+        title="Procurement Analysis Report",
+    )
+    doc.build(story)
     pdf_bytes = buf.getvalue()
     print(f"PDF generated: {len(pdf_bytes)} bytes in {time.time()-t0:.1f}s")
     return pdf_bytes

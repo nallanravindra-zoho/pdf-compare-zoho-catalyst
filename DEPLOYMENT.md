@@ -325,3 +325,57 @@ Verified with two mocked tests: (1) write phase → cancel → write next phase
 → confirm `status` is still `"cancelled"` and the `phase` field wasn't
 touched by the skipped write; (2) all 7 phase transitions still write
 correctly on the normal, non-cancelled happy path.
+
+### 2026-08-27 — Removed the unreliable close-button cancellation path; rewrote PDF generation on ReportLab
+
+Two unrelated fixes landed together.
+
+**Widget: dropped the passive close/unload cancellation attempt.** The "X"
+close button is Zoho CRM's own popup chrome, not this widget's code — it
+almost certainly detaches the iframe without a real page unload event ever
+firing, which would mean `beforeunload`/`pagehide` never ran at all (no
+JavaScript we write can intercept a close that isn't a real navigation
+event). Rather than keep unreliable "best-effort" code (`sendBeacon` +
+`ZOHO.CRM.HTTP.post` from an event listener that may never fire) implying
+coverage it couldn't actually deliver, removed it entirely — the explicit
+Cancel button (reliable, fires during the widget's normal lifecycle) is now
+the only cancellation trigger. A job that outlives a closed widget just
+finishes and attaches an unwatched PDF; harmless.
+
+**Backend: rewrote `generate_pdf_report()` on ReportLab, not xhtml2pdf.**
+Reported: garbled/overlapping report layout (currency cards running
+together with no spacing) and columns cut off past the page edge. Root
+cause, confirmed against the actual template: `xhtml2pdf` has **zero
+flexbox support** — every `display:flex` block in the old HTML/CSS template
+(`.currency-row`, `.sku-hdr`, `.margin-stats-pdf`, etc.) silently collapsed
+into plain inline flow, and several tables left columns with no explicit
+width for xhtml2pdf to auto-calculate reliably against the actual printable
+page area.
+
+The fix isn't a CSS patch — it's dropping the HTML/CSS translation layer
+entirely and building the document directly against ReportLab's own
+Platypus API (`Table`, `TableStyle`, `Paragraph`, `HRFlowable`,
+`KeepTogether`). This was a bigger win than expected: `pip show xhtml2pdf`
+confirms `reportlab` is already xhtml2pdf's own PDF-drawing dependency, so
+this costs **zero additional memory or dependency weight** — it just
+removes the unreliable translation step. `xhtml2pdf` was dropped from
+`requirements.txt` and replaced with `reportlab` directly, which also sheds
+several transitive dependencies xhtml2pdf pulled in that were never used
+(`pyHanko`/`pyhanko-certvalidator` for PDF signing, `svglib` for SVG,
+`python-bidi`/`arabic-reshaper` for RTL text) — a net reduction in the
+function's memory footprint on top of the earlier OOM fix.
+
+One real constraint discovered along the way: base-14 PDF fonts
+(Helvetica/Courier) don't include glyphs like ✓ ⚠ ↔ — rendering them
+silently drops the character rather than erroring. Used plain-ASCII
+equivalents throughout (e.g. `<->` instead of a bidirectional arrow) rather
+than embedding a Unicode TTF font just for a handful of decorative symbols.
+
+Verified by actually generating PDFs (not just checking for exceptions) and
+rendering them to images for visual inspection: real quote data from a live
+report, plus a deliberate edge-case run covering the needs-review margin
+banner, N/A-status pills, empty optional sections, long text wrapping, and
+multi-page pagination via `KeepTogether` on each SKU block. Caught and fixed
+one real bug this way — the title and subtitle overlapped vertically until
+`spaceAfter` was added to the title style; everything else rendered
+correctly on the first pass.
