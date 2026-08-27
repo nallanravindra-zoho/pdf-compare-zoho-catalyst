@@ -218,8 +218,21 @@ def _is_cancelled(context, job_id: str) -> bool:
 
 
 def _phase(context, job_id: str, phase: str):
-    """Write current phase to DataStore so the widget poll loop sees it."""
+    """
+    Write current phase to DataStore so the widget poll loop sees it.
+
+    Skips the write if the job is already cancelled. The unconditional
+    status="processing" write here used to silently clobber a "cancelled"
+    status a concurrent /cancel-job request had just set — the moment the
+    background pipeline thread reached its next _phase() call after a cancel
+    landed, it stomped the status back to "processing", permanently erasing
+    the signal for every downstream _is_cancelled() checkpoint. Confirmed
+    live: this was why cancelling during an early phase still let the job
+    run to completion, on both a fully redeployed widget and backend.
+    """
     print(f"[{job_id}] {phase}")
+    if _is_cancelled(context, job_id):
+        return
     _ds_write(context, job_id, {"status": "processing", "phase": phase})
 
 

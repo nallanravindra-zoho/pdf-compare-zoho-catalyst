@@ -291,3 +291,37 @@ Fixed:
 Verified with a mocked test: a simulated cancel click at ~0.2s into an
 80-chunk/4s fake stream was caught and the call abandoned at the ~2s check
 mark, instead of running the full 4s to completion.
+
+### 2026-08-27 — Cancel *still* not working, even with checkpoints + widget fix confirmed deployed
+
+Reported again after redeploying both the widget (with its new Cancel button)
+and the backend (with #13's 6 checkpoints) — cancelling during an early phase
+still let the job run to completion. Since both sides were confirmed current,
+this ruled out deployment lag and pointed at a real logic bug.
+
+Found it: `_phase()` unconditionally wrote `{"status": "processing", "phase":
+phase}` on **every single call** — 7 times per run — regardless of what the
+current status actually was. The race:
+
+1. A checkpoint passes (not yet cancelled).
+2. `/cancel-job` lands and correctly writes `status: "cancelled"`.
+3. The background thread, unaware, reaches its *next* `_phase()` call —
+   which blindly overwrites `status` back to `"processing"`, silently
+   erasing the cancellation the moment after it was correctly set.
+4. Every `_is_cancelled()` checkpoint from that point on reads `"processing"`
+   — nothing ever writes `"cancelled"` again, since only one cancel request
+   was sent — so the job runs to completion looking exactly like the click
+   did nothing, when it actually landed and then got erased a moment later.
+
+This explains the symptom independent of exact click timing or how many
+checkpoints exist downstream — more checkpoints don't help if the signal
+they're checking gets wiped out before they run.
+
+Fix: `_phase()` now checks `_is_cancelled()` first and skips the write
+entirely (leaving `status`/`phase` untouched) if the job is already
+cancelled, instead of blindly stomping the status.
+
+Verified with two mocked tests: (1) write phase → cancel → write next phase
+→ confirm `status` is still `"cancelled"` and the `phase` field wasn't
+touched by the skipped write; (2) all 7 phase transitions still write
+correctly on the normal, non-cancelled happy path.
