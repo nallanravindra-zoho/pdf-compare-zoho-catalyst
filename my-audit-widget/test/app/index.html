@@ -1,0 +1,1048 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AI SKU Auditor</title>
+<script src="https://live.zwidgets.com/js-sdk/1.0.5/ZohoEmbededAppSDK.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #f4f6f9; color: #1a1a2e; padding: 20px; font-size: 13px;
+  }
+  h2 { font-size: 16px; font-weight: 700; color: #1a1a2e; margin-bottom: 16px; }
+
+  .final-call { border-radius: 10px; padding: 14px 18px; margin-bottom: 20px; display: flex; align-items: flex-start; gap: 12px; }
+  .final-call.clear { background: #d1fae5; border-left: 5px solid #10b981; }
+  .final-call.query { background: #fef3c7; border-left: 5px solid #f59e0b; }
+  .final-call.hold  { background: #fee2e2; border-left: 5px solid #ef4444; }
+  .final-call .fc-icon  { font-size: 22px; line-height: 1; }
+  .final-call .fc-body  { flex: 1; }
+  .final-call .fc-title { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+  .final-call .fc-detail { font-size: 12px; line-height: 1.7; color: #374151; list-style: none; }
+
+  .card { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); padding: 16px 18px; margin-bottom: 20px; }
+  .card h3 { font-size: 13px; font-weight: 700; margin-bottom: 12px; color: #374151; text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 2px solid #f3f4f6; padding-bottom: 8px; }
+
+  .table-wrap { overflow-x: auto; width: 100%; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; table-layout: fixed; }
+
+  thead th { background: #1a1a2e; color: #fff; padding: 9px 10px; text-align: left; font-weight: 600;  }
+  table th:nth-child(1) { width: 35px; }   /* # */
+  table th:nth-child(2) { width: 140px; }  /* ZQ SKU */
+  table th:nth-child(3) { width: 50px; }   /* PPO Qty */
+  table th:nth-child(4) { width: 50px; }   /* ZQ Qty */
+  table th:nth-child(5) { width: 80px; }   /* ZQ-PPO Qty status */
+  table th:nth-child(6) { width: 50px; }   /* VQ Qty */
+  table th:nth-child(7) { width: 80px; }   /* ZQ-VQ Qty status */
+  table th:nth-child(8) { width: 80px; }   /* PPO-VQ Qty status */
+  table th:nth-child(9) { width: 90px; }   /* ZQ-PPO Price */
+  table th:nth-child(10){ width: 90px; }   /* ZQ-VQ Price */
+  table th:nth-child(11){ width: auto; }   /* Notes — takes remaining space */
+  tbody tr:hover { background: #eff6ff; }
+  tbody td {
+    padding: 8px 10px;
+    border-bottom: 1px solid #f3f4f6;
+    vertical-align: top;
+    line-height: 1.4;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+  .sku        { font-family: monospace; font-size: 11px; color: #4b5563; }
+  .notes-cell {
+    font-size: 11px;
+    color: #6b7280;
+    word-wrap: break-word;
+    white-space: normal;
+    min-width: 150px;
+}
+  .qty        { text-align: center; font-weight: 600; }
+  .qty-diff   { color: #ef4444; }
+
+  .pill         { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+  .pill-match   { background: #d1fae5; color: #065f46; }
+  .pill-review  { background: #fef3c7; color: #92400e; }
+  .pill-miss    { background: #fee2e2; color: #991b1b; }
+  .pill-na      { background: #f3f4f6; color: #9ca3af; }
+
+  /* ── ACCORDION ITEM LIST ── */
+  .sku-list     { display: flex; flex-direction: column; gap: 6px; }
+
+  .sku-row      { background: #fff; border-radius: 8px; border: 1px solid #e5e7eb;
+                  box-shadow: 0 1px 3px rgba(0,0,0,0.05); overflow: hidden; }
+
+  .sku-header   { display: flex; align-items: center; justify-content: space-between;
+                  padding: 11px 14px; cursor: pointer; user-select: none;
+                  transition: background 0.15s; }
+  .sku-header:hover { background: #f8fafc; }
+
+  .sku-left     { display: flex; align-items: center; gap: 10px; }
+  .sku-num      { font-size: 11px; color: #9ca3af; font-weight: 600; min-width: 18px; }
+  .sku-code     { font-family: monospace; font-size: 12px; font-weight: 700; color: #1a1a2e; }
+
+  .sku-right    { display: flex; align-items: center; gap: 8px; }
+  .toggle-btn   { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 6px;
+                  border: 1px solid #e5e7eb; background: #f3f4f6; color: #6b7280;
+                  cursor: pointer; transition: background 0.15s; }
+  .toggle-btn:hover { background: #e5e7eb; }
+
+  /* expanded detail panel */
+  .sku-detail   { display: none; border-top: 1px solid #f0f0f0; padding: 12px 14px 14px; }
+  .sku-detail.open { display: block; }
+
+  .detail-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .detail-table th { background: #1a1a2e; color: #fff; padding: 7px 10px;
+                     text-align: left; font-size: 11px; font-weight: 600; }
+  .detail-table th:first-child { width: 70px; }
+  .detail-table td { padding: 8px 10px; border-bottom: 1px solid #f3f4f6;
+                     vertical-align: top; line-height: 1.5; }
+  .detail-table tr:last-child td { border-bottom: none; }
+  .detail-table .row-label { font-weight: 700; color: #374151; font-size: 11px; }
+  .detail-table .cell-val  { font-family: monospace; font-size: 11px; color: #1a1a2e; }
+  .detail-table .cell-note { font-size: 11px; color: #6b7280; line-height: 1.5; }
+  .detail-table td.status-cell { text-align: left; }
+
+  /* ── HEADER VALIDATION CARD ── */
+  .hv-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .hv-table thead th { background: #1a1a2e; color: #fff; padding: 8px 10px; text-align: left; font-weight: 600; font-size: 11px; }
+  .hv-table tbody td { padding: 8px 10px; border-bottom: 1px solid #f3f4f6; vertical-align: middle; line-height: 1.4; }
+  .hv-table tbody tr:hover td { background: #eff6ff; }
+  .hv-field { font-weight: 700; color: #374151; }
+  .hv-val   { font-family: monospace; font-size: 11px; color: #1a1a2e; }
+  .hv-note  { font-size: 11px; color: #6b7280; }
+
+  .summary-section { margin-bottom: 12px; }
+  .summary-section:last-child { margin-bottom: 0; }
+  .summary-label { font-weight: 700; font-size: 12px; margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
+  .summary-list { list-style: none; padding-left: 4px; }
+  .summary-list li { padding: 5px 0 5px 12px; border-left: 3px solid #e5e7eb; margin-bottom: 4px; font-size: 12px; color: #374151; line-height: 1.5; }
+  .summary-list li.red   { border-left-color: #ef4444; }
+  .summary-list li.amber { border-left-color: #f59e0b; }
+  .tag { display: inline-block; background: #fee2e2; color: #991b1b; border-radius: 4px; padding: 3px 8px; font-size: 11px; margin: 3px; font-family: monospace; }
+
+  .currency-card { padding-top: 14px; }
+  .currency-row { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+  .currency-item { background: #f4f6f9; border-radius: 8px; padding: 8px 14px; display: flex; flex-direction: column; gap: 2px; min-width: 110px; }
+  .currency-tag-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #9ca3af; font-weight: 700; }
+  .currency-tag-value { font-size: 15px; font-weight: 700; color: #1a1a2e; font-family: monospace; }
+  .currency-notes { font-size: 12px; color: #374151; line-height: 1.6; border-top: 1px solid #f3f4f6; padding-top: 10px; margin-top: 4px; }
+
+  .state-box { text-align: center; padding: 60px 20px; color: #9ca3af; font-size: 13px; }
+  .spinner-wrap {
+    position: relative;
+    width: 80px;
+    height: 80px;
+    margin: 0 auto 20px;
+  }
+  .spinner {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    border: 7px solid transparent;
+    border-top-color: #6366f1;
+    border-right-color: #10b981;
+    border-bottom-color: #f59e0b;
+    border-left-color: #ef4444;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner-timer {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 14px;
+    font-weight: 700;
+    color: #1a1a2e;
+    font-family: monospace;
+    pointer-events: none;
+  }
+  .phase-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: #374151;
+    margin-bottom: 10px;
+  }
+  .phase-list {
+    list-style: none;
+    padding: 0;
+    margin: 16px auto 0;
+    max-width: 320px;
+    text-align: left;
+  }
+  .phase-list li {
+    font-size: 12px;
+    padding: 5px 0 5px 28px;
+    position: relative;
+    color: #9ca3af;
+    line-height: 1.4;
+  }
+  .phase-list li.done {
+    color: #065f46;
+  }
+  .phase-list li.active {
+    color: #1a1a2e;
+    font-weight: 600;
+  }
+  .phase-list li:before {
+    content: "○";
+    position: absolute;
+    left: 6px;
+    font-size: 11px;
+  }
+  .phase-list li.done:before {
+    content: "✓";
+    color: #10b981;
+  }
+  .phase-list li.active:before {
+    content: "●";
+    color: #6366f1;
+  }
+
+  .error-box { background: #fee2e2; border: 1px solid #fca5a5; border-radius: 10px; padding: 16px 20px; color: #991b1b; font-size: 13px; line-height: 1.6; }
+  .error-box strong { display: block; margin-bottom: 4px; }
+
+
+  /* ── EXISTING REPORT PROMPT ── */
+  .report-prompt {
+    background: #fff; border-radius: 10px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    padding: 20px 24px; margin-bottom: 20px;
+    border-left: 5px solid #3b82f6;
+  }
+  .report-prompt h3 { font-size: 14px; font-weight: 700; color: #1e40af; margin-bottom: 6px; }
+  .report-prompt p  { font-size: 12px; color: #374151; margin-bottom: 16px; line-height: 1.6; }
+  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  .btn { display: inline-flex; align-items: center; gap: 6px; border: none; border-radius: 8px; padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary   { background: #1a1a2e; color: #fff; }
+  .btn-secondary { background: #e5e7eb; color: #374151; }
+  .btn-danger    { background: #fee2e2; color: #991b1b; }
+
+  /* ── RUN CONFIRMATION ── */
+  .confirm-box { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); padding: 28px 28px; margin-bottom: 20px; border-left: 5px solid #6366f1; }
+  .confirm-box h3 { font-size: 15px; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
+  .confirm-box p  { font-size: 12px; color: #6b7280; margin-bottom: 22px; line-height: 1.6; }
+
+  /* ── SUCCESS BANNER ── */
+  .saved-banner {
+    background: #d1fae5; border: 1px solid #6ee7b7;
+    border-radius: 8px; padding: 10px 14px;
+    font-size: 12px; color: #065f46;
+    margin-bottom: 16px; display: flex;
+    align-items: center; gap: 8px;
+  }
+
+  /* ── MARGIN GATE — shared stat pills, used by both banner variants below ── */
+  .margin-stats { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 16px; }
+  .margin-stat {
+    background: rgba(255,255,255,0.6); border-radius: 8px; padding: 8px 14px;
+    display: flex; flex-direction: column; gap: 2px; min-width: 130px;
+  }
+  .margin-stat .m-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; font-weight: 700; }
+  .margin-stat .m-value { font-size: 16px; font-weight: 700; color: #1a1a2e; font-family: monospace; }
+  .margin-stat .m-value.bad  { color: #ef4444; }
+  .margin-stat .m-value.good { color: #065f46; }
+
+  /* ── MARGIN GATE — NEEDS REVIEW (inline, non-blocking — full result still renders below it) ── */
+  .margin-needs-review-banner {
+    background: #fef3c7; border: 1px solid #fcd34d;
+    border-radius: 10px; padding: 14px 18px;
+    margin-bottom: 16px; color: #92400e;
+  }
+  .margin-needs-review-banner .mnr-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .margin-needs-review-banner .mnr-title { font-weight: 700; font-size: 14px; }
+  .margin-needs-review-banner .mnr-detail { font-size: 12px; color: #78350f; }
+
+  /* ── MARGIN GATE — PASS (small confirmation banner, processing continues) ── */
+  .margin-pass-banner {
+    background: #d1fae5; border: 1px solid #6ee7b7;
+    border-radius: 8px; padding: 10px 16px;
+    font-size: 12px; color: #065f46;
+    margin-bottom: 16px; display: flex;
+    align-items: center; gap: 18px; flex-wrap: wrap;
+  }
+  .margin-pass-banner .mp-title { font-weight: 700; display: flex; align-items: center; gap: 6px; }
+  .margin-pass-banner .mp-stat { font-family: monospace; font-weight: 600; }
+  .margin-pass-banner .mp-stat .mp-label { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-weight: 400; color: #047857; margin-right: 4px; }
+</style>
+</head>
+<body>
+
+<h2>&#128269; PO Processing - Document Comparison</h2>
+<div id="app">
+  <div class="state-box">
+    <div class="spinner-wrap">
+      <div class="spinner"></div>
+      <div class="spinner-timer" id="spinTimer">0s</div>
+    </div>
+    <div class="phase-label">Initialising&#8230;</div>
+  </div>
+</div>
+
+<script>
+// ── CONFIG ────────────────────────────────────────────────────
+//var BASE_URL   = "https://sku-auditor-prod-162333423192.us-central1.run.app";
+var BASE_URL   = "https://project-rainfall-936611532.development.catalystserverless.com/server/doc_compare/";
+var START_URL  = BASE_URL + "/analyze-quote";
+var STATUS_URL = BASE_URL + "/job-status/";
+var CHECK_URL  = BASE_URL + "/check-report/";
+var MAX_POLL   = 120;
+var POLL_MS    = 3000;
+var pollTimer  = null;
+var currentQuoteId = null;
+var currentUserName = "";
+var currentJobId = null;
+// ── UI HELPERS ────────────────────────────────────────────────
+// Phase definitions — order determines progress list
+var PHASES = [
+  "Fetching quote from Zoho...",
+  "Checking vendor & opportunity margins...",
+  "Downloading PDF attachments...",
+  "Extracting line items with Gemini AI...",
+  "Comparing documents with Claude AI...",
+  "Generating PDF report...",
+  "Attaching report to Zoho quote..."
+];
+
+var _timerInterval = null;
+var _loadingStart  = null;
+
+function showLoading(phase) {
+  // Start timer if not already running
+  if (!_loadingStart) {
+    _loadingStart = Date.now();
+  }
+
+  // Build phase list — match by index, not by "first non-match wins".
+  // If the current phase text isn't found in PHASES at all (e.g. list gets
+  // out of sync with the backend in future), nothing is falsely marked done.
+  var activeIndex = PHASES.indexOf(phase);
+  var phaseHTML = '<ul class="phase-list">';
+  for (var i = 0; i < PHASES.length; i++) {
+    var cls = "";
+    if (activeIndex !== -1) {
+      if (i < activeIndex)      cls = "done";
+      else if (i === activeIndex) cls = "active";
+    }
+    phaseHTML += '<li class="' + cls + '">' + PHASES[i] + '</li>';
+  }
+  phaseHTML += '</ul>';
+
+  // Find elapsed if timer already running
+  var elapsed = _loadingStart ? Math.floor((Date.now() - _loadingStart) / 1000) : 0;
+
+  document.getElementById("app").innerHTML =
+    '<div class="state-box">'
+    + '<div class="spinner-wrap">'
+    + '<div class="spinner"></div>'
+    + '<div class="spinner-timer" id="spinTimer">' + elapsed + 's</div>'
+    + '</div>'
+    + '<div class="phase-label">' + (phase || "Processing...") + '</div>'
+    + phaseHTML
+    + '<button class="btn btn-secondary" style="margin-top:18px" onclick="userCancelJob()">&#10007;&nbsp; Cancel</button>'
+    + '</div>';
+
+  // Start or keep timer running
+  if (_timerInterval) clearInterval(_timerInterval);
+  _timerInterval = setInterval(function() {
+    var el = document.getElementById("spinTimer");
+    if (el && _loadingStart) {
+      el.textContent = Math.floor((Date.now() - _loadingStart) / 1000) + "s";
+    }
+  }, 1000);
+}
+
+function stopTimer() {
+  if (_timerInterval) { clearInterval(_timerInterval); _timerInterval = null; }
+  _loadingStart = null;
+}
+
+function showError(msg) {
+  // Detect attachment-specific errors and show a friendlier message
+  var isAttachmentError = msg && (
+    msg.indexOf("missing from this quote") !== -1 ||
+    msg.indexOf("PDF attachments are missing") !== -1 ||
+    msg.indexOf("Please attach") !== -1 ||
+    msg.indexOf("re-attach") !== -1
+  );
+
+  if (isAttachmentError) {
+    var lines    = msg.split("\n").filter(function(l) { return l.trim(); });
+    var headline = lines[0] || "Missing attachments";
+    var items    = lines.slice(1).map(function(l) {
+      return "<li>" + l.replace(/^[\s\-]+/, "") + "</li>";
+    }).join("");
+    document.getElementById("app").innerHTML =
+      '<div class="error-box" style="border-color:#f59e0b;background:#fffbeb;color:#92400e">'
+      + '<strong style="font-size:14px">&#128206; Attachments Missing</strong>'
+      + '<p style="margin-top:6px;margin-bottom:10px">' + headline + '</p>'
+      + (items ? '<ul style="padding-left:16px;line-height:1.8">' + items + '</ul>' : '')
+      + '<p style="margin-top:10px;font-size:11px;color:#b45309">'
+      + 'Go to the <strong>Basic Information</strong> section of this quote, upload the required PDFs, then click Compare again.'
+      + '</p></div>';
+    return;
+  }
+
+  stopTimer();
+  document.getElementById("app").innerHTML =
+    '<div class="error-box"><strong>&#9888; Error</strong>'
+    + '<p style="margin-top:4px">' + msg + '</p></div>';
+}
+
+// ── PARSE ZOHO HTTP RESPONSE ──────────────────────────────────
+function parseResponse(response) {
+  var raw = typeof response === "string" ? response : JSON.stringify(response);
+  try {
+    var outer = JSON.parse(raw);
+    if (outer && typeof outer.data    === "string") { raw = outer.data; }
+    if (outer && typeof outer.details === "string") { raw = outer.details; }
+  } catch(e) {}
+  var clean = raw.replace(/```json/g, "").replace(/```/g, "").trim();
+  return JSON.parse(clean);
+}
+
+// ── STEP 0: CHECK FOR EXISTING REPORT ────────────────────────
+// Called AFTER the user has already clicked "OK" on showRunConfirmation,
+// so timer state is guaranteed clean when we enter here.
+function checkExistingReport(quoteId) {
+  // Show a lightweight "checking" indicator without starting the analysis timer
+  document.getElementById("app").innerHTML =
+    '<div class="state-box" style="padding:40px 20px">'
+    + '<div class="phase-label">Checking for existing report&#8230;</div>'
+    + '</div>';
+
+  ZOHO.CRM.HTTP.get({
+    url: CHECK_URL + quoteId,
+    headers: { "Content-Type": "application/json" }
+  }).then(function(response) {
+    try {
+      var parsed = parseResponse(response);
+
+      if (parsed.error) {
+        // Server returned an error — show it, don't run analysis
+        showError("Check report failed: " + parsed.error
+          + "<br><br><button class='btn btn-secondary' onclick='runAnalysis(\""
+          + quoteId + "\")'>&#128260; Run Anyway</button>");
+        return;
+      }
+
+      if (parsed.exists) {
+        showExistingReportPrompt(quoteId, parsed);
+      } else {
+        // No existing report and user already confirmed — go straight to analysis
+        runAnalysis(quoteId);
+      }
+
+    } catch(e) {
+      // Parse error — show it, don't run analysis
+      showError("Failed to parse check-report response: " + e.message
+        + "<br><pre style='font-size:11px'>" + String(response).substring(0, 300) + "</pre>"
+        + "<br><button class='btn btn-secondary' onclick='runAnalysis(\""
+        + quoteId + "\")'>&#128260; Run Anyway</button>");
+    }
+
+  }).catch(function(error) {
+    // Network error — show it, don't run analysis
+    showError("Check report network error: " + JSON.stringify(error)
+      + "<br><br><button class='btn btn-secondary' onclick='runAnalysis(\""
+      + quoteId + "\")'>&#128260; Run Anyway</button>");
+  });
+}
+
+// ── SHOW EXISTING REPORT OPTIONS ─────────────────────────────
+function showExistingReportPrompt(quoteId, reportInfo) {
+  stopTimer(); // Ensure no dangling interval before rendering static prompt
+  var createdAt = reportInfo.created_time
+    ? ' Generated: ' + reportInfo.created_time
+    : "";
+
+  document.getElementById("app").innerHTML =
+    '<div class="report-prompt">'
+    + '<h3>&#128196; Existing Report Found</h3>'
+    + '<p>A procurement analysis report already exists for this quote.' + createdAt + '<br><br>'
+    + '&#128204; To view it, close this popup and open the <strong>Attachments</strong> '
+    + 'section in the left panel of this quote record.</p>'
+    + '<div class="btn-row">'
+    + '<button class="btn btn-primary" onclick="runAnalysis(\'' + quoteId + '\')">&#128260; Run Fresh Comparison</button>'
+    + '<button class="btn btn-secondary" onclick="closeWidget()">&#10007;&nbsp; Cancel</button>'
+    + '</div></div>';
+}
+
+// ── CANCELLED CONFIRMATION ───────────────────────────────────
+// Shown when a poll picks up status=cancelled — either the user clicked the
+// in-progress Cancel button, or closed the widget mid-run. Neutral-toned
+// card (not the red error box) since this is an intentional outcome, not a
+// failure. "Cancel" here closes the widget, matching the wording/behaviour
+// used by every other prompt screen in this widget.
+function showCancelledMessage(quoteId) {
+  stopTimer();
+  document.getElementById("app").innerHTML =
+    '<div class="report-prompt" style="border-left-color:#6b7280">'
+    + '<h3>&#128683; Comparison Cancelled</h3>'
+    + '<p>The document comparison was cancelled before it finished. No report was attached to this quote.</p>'
+    + '<div class="btn-row">'
+    + '<button class="btn btn-primary" onclick="runAnalysis(\'' + quoteId + '\')">&#128260; Run Again</button>'
+    + '<button class="btn btn-secondary" onclick="closeWidget()">&#10007;&nbsp; Cancel</button>'
+    + '</div></div>';
+}
+
+// ── OPEN EXISTING REPORT (inline in widget) ───────────────────
+function openExistingReport(quoteId, attachmentId) {
+  // Open directly in Zoho — no Cloud Run call needed
+  var zohoAttachmentUrl = "https://crm.zoho.com/crm/org/Quotes/"
+    + quoteId + "/Attachments/" + attachmentId;
+  window.open(zohoAttachmentUrl, "_blank");
+
+  // Show run fresh button
+  document.getElementById("app").innerHTML =
+    '<div class="report-prompt">'
+    + '<h3>&#128196; Report Opened</h3>'
+    + '<p>The existing report has been opened in a new tab.</p>'
+    + '<div class="btn-row">'
+    + '<button class="btn btn-secondary" onclick="runAnalysis(\'' + quoteId + '\')">&#128260; Run Fresh Comparison</button>'
+    + '</div></div>';
+}
+
+// ── STEP 0b: SIMPLE RUN CONFIRMATION ─────────────────────────
+function showRunConfirmation(quoteId) {
+  stopTimer(); // Always clear timer state before showing a static prompt
+  document.getElementById("app").innerHTML =
+    '<div class="confirm-box">'
+    + '<h3>&#128203; Start Document Comparison?</h3>'
+    + '<p>This will compare the Zoho Quote, Vendor Quote PDF, and Partner PO PDF '
+    + 'for SKU, quantity, and price alignment, then attach a PDF report to this quote record.</p>'
+    + '<div class="btn-row">'
+    + '<button class="btn btn-primary" onclick="checkExistingReport(\'' + quoteId + '\')">&#10003;&nbsp; OK, Start Comparison</button>'
+    + '<button class="btn btn-secondary" onclick="closeWidget()">&#10007;&nbsp; Cancel</button>'
+    + '</div></div>';
+}
+
+function closeWidget() {
+  try { ZOHO.CRM.UI.Popup.close(); } catch(e) {}
+  try { window.close(); } catch(e) {}
+}
+
+// ── STEP 1: START ANALYSIS JOB ───────────────────────────────
+function runAnalysis(quoteId) {
+  if (pollTimer) { clearTimeout(pollTimer); }
+  _loadingStart  = Date.now();
+  if (_timerInterval) { clearInterval(_timerInterval); _timerInterval = null; }
+  showLoading("Fetching quote from Zoho...");
+
+  ZOHO.CRM.HTTP.post({
+    url: START_URL,
+    body: JSON.stringify({ quote_id: quoteId, initiated_by: currentUserName }),
+    headers: { "Content-Type": "application/json" }
+  }).then(function(response) {
+    try {
+      var parsed = parseResponse(response);
+      if (parsed.job_id) {
+        pollJobStatus(parsed.job_id, quoteId, 1);
+      } else if (parsed.matching_table) {
+        render(parsed);
+      } else {
+        showError("Unexpected response.<br><pre style='font-size:11px'>"
+          + JSON.stringify(parsed, null, 2).substring(0, 400) + "</pre>");
+      }
+    } catch(e) {
+      showError("Failed to start job: " + e.message
+        + "<br><pre style='font-size:11px'>" + String(response).substring(0, 400) + "</pre>");
+    }
+  }).catch(function(error) {
+    showError("API call failed: " + JSON.stringify(error));
+  });
+}
+
+// ── STEP 2: POLL FOR RESULT ───────────────────────────────────
+function pollJobStatus(jobId, quoteId, attempt) {
+  currentJobId = jobId;
+  if (attempt > MAX_POLL) {
+    showError("Timed out after " + (MAX_POLL * POLL_MS / 1000) + "s. Please try again.");
+    return;
+  }
+  // Phase shown from server response — showLoading called after poll response
+
+  ZOHO.CRM.HTTP.get({
+    url: STATUS_URL + jobId,
+    headers: { "Content-Type": "application/json" }
+  }).then(function(response) {
+    try {
+      var parsed = parseResponse(response);
+      if (parsed.status === "done") {
+        render(parsed.result, parsed.generated_at,parsed.quote_ref);
+      } else if (parsed.status === "error") {
+        showError("Server error: " + (parsed.error || "Unknown error"));
+      } else if (parsed.status === "cancelled") {
+        showCancelledMessage(quoteId);
+      } else if (parsed.status === "not_found") {
+        showError("Job not found on the server. The server may have restarted mid-job. Please try again.");
+      } else {
+        // Still processing — show current phase from server
+        var serverPhase = parsed.phase || "Processing...";
+        showLoading(serverPhase);
+        pollTimer = setTimeout(function() {
+          pollJobStatus(jobId, quoteId, attempt + 1);
+        }, POLL_MS);
+      }
+    } catch(e) {
+      pollTimer = setTimeout(function() {
+        pollJobStatus(jobId, quoteId, attempt + 1);
+      }, POLL_MS);
+    }
+  }).catch(function() {
+    pollTimer = setTimeout(function() {
+      pollJobStatus(jobId, quoteId, attempt + 1);
+    }, POLL_MS);
+  });
+}
+
+// ── RENDER HELPERS ────────────────────────────────────────────
+function statusPill(status) {
+  if (!status || status === "-") return '<span class="pill pill-na">N/A</span>';
+  var s = status.toLowerCase();
+  // Substring matching (checked in this order) so this works for qty statuses,
+  // price statuses, and header validation statuses ("Not Found").
+  // "mismatch" must be checked before "match" since it contains "match".
+  if (s.indexOf("mismatch")  !== -1) return '<span class="pill pill-miss">&#128308; Mismatch</span>';
+  if (s.indexOf("not found") !== -1) return '<span class="pill pill-review">&#9888; Not Found</span>';
+  if (s.indexOf("review")    !== -1) return '<span class="pill pill-review">&#9888; Review</span>';
+  if (s.indexOf("match")     !== -1) return '<span class="pill pill-match">&#10003; Match</span>';
+  return '<span class="pill pill-na">' + status + "</span>";
+}
+
+function currencyCard(data) {
+  var c     = data.currencies_detected || {};
+  var qc    = c.quote_currency || "—";
+  var ppc   = c.partner_po_currency || "—";
+  var vqc   = c.vendor_quote_currency || "—";
+  var notes = c.notes || "";
+  return '<div class="card currency-card">'
+    + '<h3>&#128176; Currency Overview</h3>'
+    + '<div class="currency-row">'
+    +   '<div class="currency-item"><span class="currency-tag-label">Zoho Quote</span><span class="currency-tag-value">' + qc + '</span></div>'
+    +   '<div class="currency-item"><span class="currency-tag-label">Partner PO</span><span class="currency-tag-value">' + ppc + '</span></div>'
+    +   '<div class="currency-item"><span class="currency-tag-label">Vendor Quote</span><span class="currency-tag-value">' + vqc + '</span></div>'
+    + '</div>'
+    + (notes ? '<p class="currency-notes">' + notes + '</p>' : '')
+    + '</div>';
+}
+
+function headerValidationCard(data) {
+  var dhv = data.document_header_validation;
+  if (!dhv) return '';
+
+  function hvRow(label, field) {
+    if (!field) return '';
+    var zqVal  = field.zq_value  || "—";
+    var pdfVal = field.pdf_value || "—";
+    var status = field.status    || "—";
+    var note   = field.note      || "";
+    return '<tr>'
+      + '<td class="hv-field">' + label  + '</td>'
+      + '<td class="hv-val">'   + zqVal  + '</td>'
+      + '<td class="hv-val">'   + pdfVal + '</td>'
+      + '<td style="text-align:center">' + statusPill(status) + '</td>'
+      + '<td class="hv-note">'  + note   + '</td>'
+      + '</tr>';
+  }
+
+  var rows = hvRow("Reseller",         dhv.reseller)
+           + hvRow("Partner PO Ref",   dhv.partner_po_ref)
+           + hvRow("Vendor",           dhv.vendor)
+           + hvRow("Vendor Quote Ref", dhv.vendor_quote_ref);
+
+  if (!rows) return '';
+
+  return '<div class="card">'
+    + '<h3>&#128196; Document Header Validation</h3>'
+    + '<table class="hv-table"><thead><tr>'
+    + '<th style="width:130px">Field</th>'
+    + '<th>Zoho Quote Value</th>'
+    + '<th>PDF Extracted Value</th>'
+    + '<th style="width:120px;text-align:center">Status</th>'
+    + '<th>Note</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>'
+    + '</div>';
+}
+
+// Subtotal Validation — Partner PO / Vendor Quote subtotals (converted to USD,
+// computed server-side) vs the Opportunity's Amount_in_USD / Net_to_Vendor.
+// Reporting-only card, shown below the line-item matching table — does not
+// affect final_call or any other section.
+function subtotalValidationCard(data) {
+  var sv = data.subtotal_validation;
+  if (!sv) return '';
+
+  function fmtUsd(v) {
+    return (v !== null && v !== undefined) ? '$' + Number(v).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}) : '—';
+  }
+  function fmtRaw(v, currency) {
+    if (v === null || v === undefined) return '—';
+    var n = Number(v).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+    return currency ? n + ' ' + currency : n;
+  }
+
+  function svRow(d) {
+    if (!d) return '';
+    return '<tr>'
+      + '<td class="hv-field">' + (d.label || '') + '</td>'
+      + '<td class="hv-val">' + fmtRaw(d.pdf_subtotal, d.pdf_currency) + '</td>'
+      + '<td class="hv-val">' + fmtUsd(d.pdf_subtotal_usd) + '</td>'
+      + '<td class="hv-val">' + fmtUsd(d.opportunity_value) + '</td>'
+      + '<td style="text-align:center">' + statusPill(d.status) + '</td>'
+      + '</tr>';
+  }
+
+  var rows = svRow(sv.partner_po) + svRow(sv.vendor_quote);
+  if (!rows) return '';
+
+  return '<div class="card">'
+    + '<h3>&#128176; Subtotal Validation (vs Opportunity)</h3>'
+    + '<table class="hv-table"><thead><tr>'
+    + '<th style="width:230px">Check</th>'
+    + '<th>PDF Subtotal</th>'
+    + '<th>Converted (USD)</th>'
+    + '<th>Opportunity Value</th>'
+    + '<th style="width:120px;text-align:center">Status</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>'
+    + '<div style="margin-top:10px;font-size:12px;color:#374151;display:flex;align-items:center;gap:8px">'
+    + 'Overall: ' + statusPill(sv.overall_status)
+    + '</div>'
+    + '</div>';
+}
+
+function finalCallBanner(data) {
+  var fc  = (data.final_call || "").toUpperCase();
+  var cls = "query", icon = "!";
+  if (fc.indexOf("CLEAR") !== -1) { cls = "clear"; icon = "&#10003;"; }
+  if (fc.indexOf("HOLD")  !== -1) { cls = "hold";  icon = "&#10007;"; }
+  //var details = (data.final_call_detail || []).map(function(d) { return "<li>&#8226; " + d + "</li>"; }).join("");
+  var details ='';
+  return '<div class="final-call ' + cls + '">'
+    + '<div class="fc-icon">' + icon + "</div>"
+    + '<div class="fc-body"><div class="fc-title">' + (data.final_call || "") + "</div>"
+    + (details ? '<ul class="fc-detail">' + details + "</ul>" : "")
+    + "</div></div>";
+}
+
+function worstStatus() {
+  var statuses = Array.prototype.slice.call(arguments);
+  var rank = function(s) {
+    if (!s || s === "-") return 0;
+    var sl = s.toLowerCase();
+    if (sl.indexOf("mismatch") !== -1) return 3;
+    if (sl.indexOf("review")   !== -1) return 2;
+    if (sl.indexOf("match")    !== -1) return 1;
+    return 0;
+  };
+  var best = statuses.reduce(function(max, s) { return Math.max(max, rank(s)); }, 0);
+  if (best === 3) return "mismatch";
+  if (best === 2) return "review";
+  if (best === 1) return "match";
+  return "na";
+}
+
+function overallPill(r) {
+  var w = worstStatus(
+    r.zq_status, r.vq_status, r.ppo_status,
+    r.list_price_comparison_status, r.buy_price_comparison_status
+  );
+  if (w === "mismatch") return '<span class="pill pill-miss">&#128308; Mismatch</span>';
+  if (w === "review")   return '<span class="pill pill-review">&#9888; Review</span>';
+  if (w === "match")    return '<span class="pill pill-match">&#10003; Match</span>';
+  return '<span class="pill pill-na">N/A</span>';
+}
+
+function matchingTable(rows) {
+  if (!rows || rows.length === 0) return '<p style="color:#9ca3af;font-size:12px">No items found.</p>';
+
+  var items = rows.map(function(r, idx) {
+    var id = "sku-" + idx;
+    var overall = overallPill(r);
+
+    var zqQty  = (r.zq_qty  != null && r.zq_qty  !== "") ? String(r.zq_qty)  : "-";
+    var vqQty  = (r.vq_qty  != null && r.vq_qty  !== "") ? String(r.vq_qty)  : "-";
+    var ppoQty = (r.ppo_qty != null && r.ppo_qty !== "") ? String(r.ppo_qty) : "-";
+    var note   = (r.notes || "").replace(/\s+/g, " ").trim();
+
+    // ── QTY ROW ─────────────────────────────────────────────
+    // Always show ZQ | PPO | VQ values.
+    // If all three qty statuses are Match → show a single Match pill in status column.
+    // Otherwise show individual labelled pills.
+    var allQtyMatch = (
+      (r.zq_status  || "").toLowerCase().indexOf("match") !== -1 &&
+      (r.vq_status  || "").toLowerCase().indexOf("match") !== -1 &&
+      (r.ppo_status || "").toLowerCase().indexOf("match") !== -1 &&
+      (r.zq_status  || "").toLowerCase().indexOf("mismatch") === -1 &&
+      (r.vq_status  || "").toLowerCase().indexOf("mismatch") === -1 &&
+      (r.ppo_status || "").toLowerCase().indexOf("mismatch") === -1
+    );
+
+    var qtyRow;
+    if (allQtyMatch) {
+      qtyRow = '<tr>'
+        + '<td class="row-label">Qty</td>'
+        + '<td class="cell-val">' + zqQty + '</td>'
+        + '<td class="cell-val">' + ppoQty + '</td>'
+        + '<td class="cell-val">' + vqQty + '</td>'
+        + '<td class="status-cell">' + statusPill("Match") + '</td>'
+        + '</tr>';
+    } else {
+      qtyRow = '<tr>'
+        + '<td class="row-label">Qty</td>'
+        + '<td class="cell-val">' + zqQty + '</td>'
+        + '<td class="cell-val">' + ppoQty + '</td>'
+        + '<td class="cell-val">' + vqQty + '</td>'
+        + '<td class="status-cell">'
+        +   '<div style="display:flex;flex-direction:column;gap:3px">'
+        +     '<span style="font-size:10px;color:#9ca3af">ZQ↔PPO&nbsp;' + statusPill(r.zq_status)  + '</span>'
+        +     '<span style="font-size:10px;color:#9ca3af">ZQ↔VQ&nbsp;&nbsp;' + statusPill(r.vq_status)  + '</span>'
+        +     '<span style="font-size:10px;color:#9ca3af">PPO↔VQ&nbsp;' + statusPill(r.ppo_status) + '</span>'
+        +   '</div>'
+        + '</td>'
+        + '</tr>';
+    }
+
+    // ── PRICE ROWS ───────────────────────────────────────────
+    // List Price: ZQ list_price vs PPO partner_ppo_price_original  → list_price_comparison_status
+    // Buy Price:  ZQ buy_price  vs VQ vendor_quote_price           → buy_price_comparison_status
+    var listPriceRow = '<tr style="background:#fafafa">'
+      + '<td class="row-label" style="padding-left:18px;color:#6b7280;font-weight:400">List&nbsp;Price</td>'
+      + '<td class="cell-val">' + (r.list_price_zq || "-") + '</td>'
+      + '<td class="cell-val">' + (r.partner_ppo_price_original || "-") + '</td>'
+      + '<td class="cell-val" style="color:#9ca3af">—</td>'
+      + '<td class="status-cell">' + statusPill(r.list_price_comparison_status) + '</td>'
+      + '</tr>';
+
+    var buyPriceRow = '<tr style="background:#fafafa">'
+      + '<td class="row-label" style="padding-left:18px;color:#6b7280;font-weight:400">Buy&nbsp;Price</td>'
+      + '<td class="cell-val">' + (r.buy_price_zq || "-") + '</td>'
+      + '<td class="cell-val" style="color:#9ca3af">—</td>'
+      + '<td class="cell-val">' + (r.vendor_quote_price || "-") + '</td>'
+      + '<td class="status-cell">' + statusPill(r.buy_price_comparison_status) + '</td>'
+      + '</tr>';
+
+    // Price section header row
+    var priceHeaderRow = '<tr>'
+      + '<td class="row-label">Price</td>'
+      + '<td class="cell-val" style="font-size:10px;color:#9ca3af;font-weight:600">ZQ</td>'
+      + '<td class="cell-val" style="font-size:10px;color:#9ca3af;font-weight:600">PPO</td>'
+      + '<td class="cell-val" style="font-size:10px;color:#9ca3af;font-weight:600">VQ</td>'
+      + '<td></td>'
+      + '</tr>';
+
+    var noteRow = note
+      ? '<tr><td class="row-label">Notes</td><td colspan="4" class="cell-note">' + note + '</td></tr>'
+      : '';
+
+    var detailTable =
+      '<table class="detail-table">'
+      + '<thead><tr>'
+      +   '<th style="width:80px"></th>'
+      +   '<th>ZQ</th>'
+      +   '<th>PPO</th>'
+      +   '<th>VQ</th>'
+      +   '<th style="width:140px">Status</th>'
+      + '</tr></thead>'
+      + '<tbody>'
+      +   qtyRow
+      +   priceHeaderRow
+      +   listPriceRow
+      +   buyPriceRow
+      +   noteRow
+      + '</tbody></table>';
+
+    return '<div class="sku-row">'
+      + '<div class="sku-header" onclick="toggleSku(\'' + id + '\')">'
+      +   '<div class="sku-left">'
+      +     '<span class="sku-num">' + (r.num || idx + 1) + '</span>'
+      +     '<span class="sku-code">' + (r.sku || "—") + '</span>'
+      +   '</div>'
+      +   '<div class="sku-right">'
+      +     overall
+      +     '<span class="toggle-btn" id="btn-' + id + '">Show</span>'
+      +   '</div>'
+      + '</div>'
+      + '<div class="sku-detail" id="' + id + '">'
+      +   detailTable
+      + '</div>'
+      + '</div>';
+  }).join("");
+
+  return '<div class="sku-list">' + items + '</div>';
+}
+
+function toggleSku(id) {
+  var panel = document.getElementById(id);
+  var btn   = document.getElementById("btn-" + id);
+  if (!panel) return;
+  var isOpen = panel.classList.contains("open");
+  panel.classList.toggle("open", !isOpen);
+  if (btn) btn.textContent = isOpen ? "Show" : "Hide";
+}
+
+function summarySection(data) {
+  var resolve   = (data.must_resolve    || []).map(function(i) { return '<li class="red">'   + i + "</li>"; }).join("") || "<li>None</li>";
+  var review    = (data.needs_review    || []).map(function(i) { return '<li class="amber">' + i + "</li>"; }).join("") || "<li>None</li>";
+  var unmatched = (data.unmatched_items || []).map(function(i) { return '<span class="tag">' + i + "</span>"; }).join("");
+  return '<div class="summary-section">'
+    + '<div class="summary-label" style="color:#ef4444">&#10007; Must Resolve Before Processing</div>'
+    + '<ul class="summary-list">' + resolve + "</ul></div>"
+    + '<div class="summary-section">'
+    + '<div class="summary-label" style="color:#f59e0b">&#9888; Needs Human Review</div>'
+    + '<ul class="summary-list">' + review + "</ul></div>"
+    + (unmatched ? '<div class="summary-section"><div class="summary-label" style="color:#ef4444">&#10007; Unmatched Items</div><div>' + unmatched + "</div></div>" : "")
+    + '<div class="summary-section" style="margin-top:10px">'
+    + '<div class="summary-label" style="color:#10b981">&#10003; Overall</div>'
+    + '<p style="font-size:12px;color:#374151;line-height:1.6">' + (data.overall_summary || "") + "</p></div>";
+}
+
+function marginStat(label, value, tone) {
+  var cls = tone ? " " + tone : "";
+  return '<div class="margin-stat">'
+    + '<span class="m-label">' + label + '</span>'
+    + '<span class="m-value' + cls + '">' + (value === null || value === undefined || value === "" ? "&#8212;" : value) + '</span>'
+    + '</div>';
+}
+
+// Inline amber banner — shown ABOVE the normal full result when the margin
+// gate ran and Gross Margin < Vendor Margin. NON-BLOCKING: this used to
+// replace the entire result (short-circuit); it no longer does. The full
+// comparison (currency card, header validation, matching table, summary)
+// still renders underneath exactly as if the check had passed.
+function marginNeedsReviewBanner(mg) {
+  var gm = mg.gross_margin;
+  var vm = mg.vendor_margin;
+  return '<div class="margin-needs-review-banner">'
+    + '<div class="mnr-row">'
+    + '<span class="mnr-title">&#9888; Margin Check &#8212; Needs Review</span>'
+    + '<span class="mnr-detail">Gross Margin (' + (gm !== null && gm !== undefined ? gm + '%' : '—')
+    + ') is less than Minimum Vendor Margin (' + (vm !== null && vm !== undefined ? vm + '%' : '—') + ')</span>'
+    + '</div>'
+    + '<div class="margin-stats" style="margin-top:10px">'
+    + marginStat("Opportunity", mg.opportunity_name, null)
+    + marginStat("Vendor", mg.vendor_name, null)
+    + marginStat("Gross Margin %", (gm !== null && gm !== undefined) ? gm + '%' : null, "bad")
+    + marginStat("Minimum Vendor Margin %", (vm !== null && vm !== undefined) ? vm + '%' : null, "good")
+    + '</div>'
+    + '</div>';
+}
+
+// Small green confirmation banner — shown ABOVE the normal full result when
+// the margin gate ran and passed. Processing continues underneath as usual.
+function marginPassBanner(mg) {
+  var gm = mg.gross_margin;
+  var vm = mg.vendor_margin;
+  return '<div class="margin-pass-banner">'
+    + '<span class="mp-title">&#9989; Margin check passed</span>'
+    + '<span class="mp-stat"><span class="mp-label">Gross Margin</span>' + (gm !== null && gm !== undefined ? gm + '%' : '—') + '</span>'
+    + '<span class="mp-stat"><span class="mp-label">Minimum Vendor Margin</span>' + (vm !== null && vm !== undefined ? vm + '%' : '—') + '</span>'
+    + '</div>';
+}
+
+// Dispatcher — picks pass vs needs-review, or nothing if the gate was skipped
+// (missing data / config issue, per mg.checked === false).
+function marginGateBanner(mg) {
+  if (!mg || !mg.checked) return "";
+  return mg.needs_review ? marginNeedsReviewBanner(mg) : marginPassBanner(mg);
+}
+
+function render(data, generatedAt,quoteRef) {
+  stopTimer();
+
+  // Quote reference header — always fine to show
+  var quoteHeader = (quoteRef)
+    ? '<div style="background:#fff;border-radius:8px;padding:10px 16px;'
+      + 'margin-bottom:16px;border:1px solid #e5e7eb;font-size:12px;color:#374151">'
+      + '<span style="font-weight:700;color:#1a1a2e">Quote Reference: </span>'
+      + '<span style="font-family:monospace;color:#6366f1;font-size:13px;font-weight:600">'
+      + (quoteRef || "") + '</span>'
+      + '</div>'
+    : "";
+
+  var savedBanner = generatedAt
+    ? '<div class="saved-banner">Report saved as PDF attachment'
+      + (quoteRef ? ' &nbsp;|&nbsp; <strong>' + quoteRef + '</strong>' : '')
+      + ' &nbsp;(' + generatedAt + ')'
+      + ' &nbsp;<button class="btn btn-secondary" style="padding:4px 10px;font-size:11px" '
+      + 'onclick="showRunConfirmation(\'' + currentQuoteId + '\')">&#128260; Run Fresh</button></div>'
+    : "";
+
+  // Margin gate outcome (pass / needs review / nothing if skipped) — shown as
+  // a banner above the result. The full comparison below always renders
+  // regardless of which one this is; the gate no longer blocks anything.
+  var marginBanner = marginGateBanner(data.margin_gate);
+
+  document.getElementById("app").innerHTML =
+    savedBanner
+    + quoteHeader
+    + marginBanner
+    + currencyCard(data)
+    + headerValidationCard(data)
+    + finalCallBanner(data)
+    + '<div class="card"><h3>&#128203; Section 1 &#8212; Three-Way Item Matching</h3>'
+    + matchingTable(data.matching_table || []) + "</div>"
+    + subtotalValidationCard(data)
+    + '<div class="card"><h3>&#128202; Section 2 &#8212; Summary</h3>'
+    + summarySection(data) + "</div>";
+}
+
+// Only ever called from the explicit Cancel button (see showLoading) — there
+// is no passive close/unload cancellation path. Zoho's own popup "X" almost
+// certainly detaches this widget's iframe without a real page unload event,
+// so beforeunload/pagehide listeners never fired reliably for it; removed
+// rather than kept as dead-weight code implying coverage that didn't exist.
+function userCancelJob() {
+  if (!currentJobId) return;
+  var jobToCancel = currentJobId;
+  currentJobId    = null;
+
+  ZOHO.CRM.HTTP.post({
+    url: BASE_URL + "/cancel-job/" + jobToCancel,
+    body: "{}",
+    headers: { "Content-Type": "application/json" }
+  });
+  console.log("Cancel sent for: " + jobToCancel);
+
+  stopTimer();
+  document.getElementById("app").innerHTML =
+    '<div class="state-box"><div class="phase-label">Cancelling&#8230;</div></div>';
+}
+
+// ── BOOT ──────────────────────────────────────────────────────
+ZOHO.embeddedApp.on("PageLoad", function(data) {
+  ZOHO.CRM.UI.Resize({ height: "900", width: "1200" });
+  var quoteId = data.EntityId ? data.EntityId[0] : null;
+  if (!quoteId) {
+    showError("Could not read Quote ID from Zoho record.");
+    return;
+  }
+  currentQuoteId = quoteId;
+
+  // Fetch logged-in user name so the PDF report can record who initiated it
+  ZOHO.CRM.CONFIG.getCurrentUser().then(function(resp) {
+    try {
+      var u = resp && resp.users && resp.users[0];
+      currentUserName = u ? (u.full_name || u.email || "") : "";
+    } catch(e) {
+      currentUserName = "";
+    }
+  }).catch(function() {
+    currentUserName = "";
+  });
+
+  // Show confirmation FIRST before any API calls or loading state starts.
+  // This avoids the dangling _timerInterval bug where showLoading() fires
+  // during checkExistingReport, then showRunConfirmation() replaces the DOM
+  // without calling stopTimer(), leaving dirty timer state for runAnalysis.
+  showRunConfirmation(quoteId);
+});
+
+ZOHO.embeddedApp.init();
+</script>
+
+</body>
+</html>

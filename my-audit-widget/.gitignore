@@ -1,0 +1,6 @@
+# Local widget dev/test harness — regenerable or machine-local
+node_modules/
+dist/
+*.pem
+*.log
+.DS_Store
